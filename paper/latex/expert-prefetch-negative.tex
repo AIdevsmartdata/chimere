@@ -1,0 +1,96 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage[margin=2.5cm]{geometry}
+
+\title{Expert Prefetch for Consumer MoE Inference:\\86.65\% Prediction Accuracy, Zero Speedup}
+
+\author{
+  K\'evin Remondi\`ere\\
+  Independent Researcher, Oloron-Sainte-Marie, France\\
+  \texttt{kevin.remondiere@gmail.com}\\
+  ORCID: \href{https://orcid.org/0009-0008-2443-7166}{0009-0008-2443-7166}
+}
+
+\date{March 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We built an expert prefetch system for Qwen3.5-35B-A3B inference on RTX~5060~Ti, aiming to recover the 10--14~tok/s lost from CPU expert offloading (\texttt{ncmoe=4}). An MLP predictor achieves 86.65\% hit@8 accuracy, and a GPU-side LRU cache with batched IQ3\_S GEMV kernels provides correct expert outputs in $\sim$34\,$\mu$s. The result: \textbf{+1.1\% throughput (performance-neutral)}. We analyze why expert prefetch fails on current consumer hardware and identify the conditions under which it would succeed.
+\end{abstract}
+
+\section{Motivation}
+
+With \texttt{ncmoe=4} (4~layers' MoE experts offloaded to CPU), Qwen3.5-35B-A3B runs at 93~tok/s on RTX~5060~Ti. Without offloading, it would need $\sim$25\,GB VRAM (exceeds 16\,GB). The hypothesis: prefetch the next layer's experts to GPU while the current layer processes on CPU, hiding the PCIe transfer latency.
+
+\section{System Architecture}
+
+\begin{enumerate}
+  \item \textbf{ggml callback hook}: intercepts \texttt{ggml\_compute\_forward\_mul\_mat\_id()} on thread~0 before the CPU expert loop.
+  \item \textbf{Prediction}: MLP predictor (7.3M params, trained on expert activation traces) predicts which 8~experts will be needed at the next layer.
+  \item \textbf{GPU prefetch}: \texttt{cuCtxPushCurrent} $\to$ memcpy experts to GPU $\to$ Q8\_1 quantize activation $\to$ batched IQ3\_S MMVQ $\to$ sync $\to$ copy output back.
+  \item \textbf{LRU cache}: 48~slots per layer on GPU (495\,MB total). Cache-on-miss for unpredicted experts.
+\end{enumerate}
+
+Four predictor variants were trained:
+\begin{itemize}
+  \item Base same-layer (35\,MB): predicts layer $\ell$ experts from layer $\ell$ hidden state
+  \item ncmoe=8 variant (37\,MB): targets deeper offloading
+  \item Cross-layer (19\,MB): predicts layer $\ell$ from layer $\ell{-}1$ (token N$-$1 $\to$ N)
+  \item Cross-layer + focal loss (32\,MB): addresses class imbalance
+\end{itemize}
+
+\section{Results}
+
+\subsection{Prediction Accuracy}
+
+The base predictor achieves 86.65\% hit@8. Cross-layer prediction drops to 54--68\% because MoE expert selection is unstable between consecutive tokens --- knowing which experts token $N{-}1$ used tells you little about token $N$.
+
+\subsection{Cache Performance}
+
+Surprisingly, a simple cache-on-miss (no prediction) achieves 57.9\% hit rate --- comparable to the cross-layer predictor. Expert reuse across consecutive tokens is naturally high for the first 4~layers.
+
+\subsection{Throughput Impact}
+
+\textbf{+1.1\% throughput.} Performance-neutral within measurement noise.
+
+\section{Why Prefetch Fails}
+
+The root cause is a \textbf{threading conflict}:
+
+\begin{enumerate}
+  \item ggml's MoE CPU loop is multi-threaded (12~threads on i5-14600KF).
+  \item The callback runs on thread~0 only.
+  \item Thread~0 blocks on \texttt{cudaStreamSync} while doing GPU work ($\sim$34\,$\mu$s).
+  \item The other 11~threads wait at \texttt{ggml\_barrier} for thread~0.
+  \item GPU work replaces \emph{parallel CPU work} with \emph{serial GPU work}.
+\end{enumerate}
+
+Even with perfect prediction, the GPU prefetch \emph{serializes} what was a parallel CPU computation. The net effect is zero.
+
+\subsection{When Would Prefetch Work?}
+
+Expert prefetch becomes profitable when:
+\begin{itemize}
+  \item Experts are \textbf{large} ($>$5\,MB each, so CPU GEMV $>$500\,$\mu$s) --- ours are 430\,KB.
+  \item The CPU has \textbf{few cores} (prefetch overhead $<$ single-thread CPU GEMV).
+  \item PCIe bandwidth is the \textbf{bottleneck} (PCIe 3.0, shared bus).
+  \item The runtime supports \textbf{async callback} (not blocking thread~0).
+\end{itemize}
+
+On our hardware (i5-14600KF, 12~threads, PCIe 4.0 x8, 430\,KB experts, 50\,$\mu$s CPU GEMV), \emph{none} of these conditions hold.
+
+\section{Additional Negative Finding: Q4\_K/Q5\_K Prefetch Bug}
+
+IQ3\_S prefetch worked correctly (custom batched kernel). Q4\_K and Q5\_K produced subtly wrong values ($\sim$3\% maxdiff). Stock llama.cpp Q4\_K/Q5\_K kernels produced \textbf{all zeros} (wrapper bug). The model appeared to work because zero MoE output = shared expert compensates. Root cause remains unknown after exhaustive debugging.
+
+\section{Conclusion}
+
+Expert prefetch is a plausible optimization that fails on current consumer hardware due to threading constraints and small expert sizes. The 86.65\% prediction accuracy is a genuine result; the zero speedup is an equally genuine result. We release all 4~predictor models and the analysis.\footnote{\url{https://huggingface.co/datasets/Kevletesteur/chimere-expert-predictor}}
+
+\end{document}

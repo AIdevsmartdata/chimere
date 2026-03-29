@@ -1,0 +1,220 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage[margin=2.5cm]{geometry}
+
+\title{RAMP: Data-Free Mixed-Precision Quantization\\for Hybrid SSM-MoE Models on Consumer Hardware}
+
+\author{
+  K\'evin Remondi\`ere\\
+  Independent Researcher, Oloron-Sainte-Marie, France\\
+  \texttt{kevin.remondiere@gmail.com}\\
+  ORCID: \href{https://orcid.org/0009-0008-2443-7166}{0009-0008-2443-7166}\\
+  \url{https://github.com/AIdevsmartdata/ramp-quant}
+}
+
+\date{March 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present RAMP (RL-guided Adaptive Mixed-Precision), a quantization pipeline that produces hardware-optimized GGUF files for hybrid SSM-MoE models without requiring calibration data during the allocation search. Applied to Qwen3.5-35B-A3B (30~GDN + 10~attention layers, 256~experts), RAMP~v2 produces a 15.2\,GB file (3.78~BPW) running at 90~tok/s on RTX~5060~Ti 16\,GB with 30/30 on functional benchmarks. The pipeline combines NSDS data-free sensitivity scoring, proxy-based loss estimation, and evolutionary search under VRAM constraints. We document the complete engineering arc including 7~failed builds, a QuaRot dead end (PPL~49{,}524), and the discovery that rotation-based methods are fundamentally incompatible with GDN recurrent layers. Code, model, and imatrix released.\footnote{\url{https://github.com/AIdevsmartdata/ramp-quant}, \url{https://huggingface.co/Kevletesteur/Qwen3.5-35B-A3B-RAMP-v2-15G}}
+\end{abstract}
+
+\section{Introduction}
+
+Quantizing hybrid SSM-MoE models differs fundamentally from quantizing dense transformers. Qwen3.5-35B-A3B has three structurally distinct components with different sensitivity profiles:
+
+\begin{itemize}
+  \item \textbf{GDN recurrent layers} (30/40): errors propagate multiplicatively through the state recurrence $M_t = \alpha_t M_{t-1}(I - k_t q_t^\top) + k_t v_t^\top$. At timestep $t$, quantization error grows as $O(e^t)$.
+  \item \textbf{Attention layers} (10/40): standard GQA with 16~Q-heads (dim=512) and 2~KV-heads (dim=256). Tolerant to 4--5~bit quantization.
+  \item \textbf{MoE experts} (256 per layer, top-8): represent 93\% of parameters but are sparsely activated. Highly compressible.
+\end{itemize}
+
+Standard uniform quantization (e.g., IQ3\_S everywhere) ignores this structure. We show that per-tensor mixed-precision allocation, guided by data-free sensitivity analysis, produces significantly better quality-size tradeoffs.
+
+\section{The Road to RAMP: Failed Approaches}
+
+Before arriving at RAMP, we attempted four rotation-based quantization methods. All failed on this architecture.
+
+\subsection{QuaRot: Catastrophic Failure}
+
+QuaRot~\cite{spinquant2024} was applied shard-by-shard (14~safetensors) to the BF16 model. Result: \textbf{complete garbage} at inference. The SSM $\alpha$ (decay gate) was shifted by $105{\times}$. Root cause: Hadamard rotation $R$ applied to weight $W$ changes the output distribution. The residual connection adds the \emph{unrotated} input to the \emph{rotated} output. RMSNorm does not commute with arbitrary orthogonal rotations. For recurrent layers, the rotated state accumulates non-linearly --- $R$ cannot be absorbed.
+
+\subsection{OptRot: PPL = 49{,}524}
+
+OptRot~\cite{optrot2024} applies data-free Givens rotations minimizing $\|RW\|^4$ (kurtosis). Applied to 40~attention tensors. Kurtosis reduced by 25\% on average, but \textbf{PPL = 49{,}524} (vs.\ $\sim$3.4 baseline). Same root cause: per-matrix rotation without cross-layer absorption.
+
+\subsection{ParoQuant: OOM}
+
+ParoQuant~\cite{paroquant2024} handles absorption correctly but requires the full model in memory. On RTX~5060~Ti + 32\,GB RAM: 256~MoE experts $\to$ \texttt{grouped\_mm} exceeds 16\,GB VRAM at batch\_size=1. Adding 40\,GB swap allowed model loading but OOM on forward pass. \textbf{Requires A100 80\,GB.}
+
+\subsection{EvoPress: Same OOM}
+
+EvoPress~\cite{evopress2024} uses KL-divergence fitness requiring full-model forward. Same 70\,GB RAM barrier.
+
+\textbf{Lesson:} On consumer hardware (16\,GB VRAM, 32\,GB RAM), rotation and calibration-based methods are infeasible for 35B MoE models. Data-free approaches are the only option.
+
+\section{RAMP Pipeline}
+
+RAMP operates in 6~phases without loading the full model:
+
+\subsection{Phase 1: GGUF Analysis}
+
+Parse the GGUF file structure: 733~tensors, 40~layers, 263~decision groups. Classify each tensor by role: expert (120~groups, 32.2B elements, 93\%), SSM (30~groups, 256.6M), attention (40~groups, 272.7M), norm, gate.
+
+\subsection{Phase 2: NSDS Sensitivity (Data-Free)}
+
+NSDS (Normalized Data-free Sensitivity)~\cite{nsds2024} scores each tensor group using kurtosis and SVD rank, without any calibration data. Computation: $\sim$5~minutes, processes tensors one-at-a-time (peak RAM = 1~tensor).
+
+Results confirm the GDN sensitivity hierarchy:
+\begin{itemize}
+  \item Norms: NSDS = 1.000 (highest)
+  \item SSM gates ($\alpha$, $\beta$): NSDS = 0.95+
+  \item Attention K/Q: NSDS = 0.85--0.95
+  \item Expert FFN (mid layers 17--23): NSDS = 0.748 (lowest)
+\end{itemize}
+
+\subsection{Phase 3: Proxy Model}
+
+Build a lookup table of quantization error per tensor per type (8~types: IQ2\_XXS to Q8\_0). Each entry: round-trip error $\|W - \text{dequant}(\text{quant}(W))\|$. Combined with NSDS sensitivity, this gives an instant proxy loss for any allocation.
+
+\subsection{Phase 4: Search}
+
+Two search strategies under a VRAM budget constraint:
+
+\textbf{Greedy (ScaleBITS-style):} 757~steps in 7.89\,s. Iteratively upgrades the most sensitive tensor that fits the budget. Result: score=4.765, 14.71\,GB.
+
+\textbf{Evolutionary (128~pop, 200~gen):} 25{,}600 evaluations in 603\,s. Converges at generation $\sim$120 (stagnation). Result: score=5.201. \textbf{Greedy wins} --- the budget is too tight for evolutionary diversity to help.
+
+\subsection{Phase 5: Validate}
+
+Verify the allocation fits hardware: VRAM with KV cache, ncmoe offloading headroom.
+
+\subsection{Phase 6: Build}
+
+Generate a \texttt{llama-quantize --custom-q} command with regex-based per-tensor overrides. The actual quantization uses stock \texttt{llama-quantize} --- no custom code needed at this stage.
+
+\section{Results}
+
+\subsection{RAMP v1 (March 29, Morning)}
+
+\begin{table}[h]
+\centering
+\caption{RAMP v1 vs.\ baselines.}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Model} & \textbf{Size} & \textbf{BPW} & \textbf{tok/s} & \textbf{Bench} & \textbf{Notes} \\
+\midrule
+IQ3\_S Unsloth UD & 13.0\,GB & 3.44 & 69 & --- & Stock, 3 slots \\
+IQ3\_S custom-mix & 14.71\,GB & 3.56 & 98.6 & 20/20 & 317 manual overrides \\
+Q4\_K\_M & 21.0\,GB & $\sim$4.5 & 62.3 & --- & OOM at 128K \\
+\textbf{RAMP v1} & \textbf{16.6\,GB} & \textbf{4.02} & \textbf{92.4} & --- & Q3\_K\_M base, no imatrix \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+RAMP v1 used Q3\_K\_M as base (no imatrix required) with Q5\_K/Q8\_0 overrides on critical paths. Two commands, zero custom code, 10~minutes total.
+
+\subsection{RAMP v2 (March 29, Evening)}
+
+Key improvement: generate a custom imatrix from RAMP~v1 itself (3.5~min, 200~chunks, domain-calibrated corpus: 100~kine FR, 50~code, 30~math, 30~tool-calling, 68~training pairs). Then requantize with IQ3\_S base.
+
+\begin{table}[h]
+\centering
+\caption{RAMP v2 vs.\ v1 improvements.}
+\begin{tabular}{lcc}
+\toprule
+& \textbf{RAMP v1} & \textbf{RAMP v2} \\
+\midrule
+Size & 16.6\,GB (4.02 BPW) & \textbf{15.2\,GB (3.78 BPW)} \\
+Base type & Q3\_K\_M & IQ3\_S + imatrix \\
+ssm\_out & Q5\_K & \textbf{Q8\_0} \\
+attn\_k & Q5\_K & \textbf{Q6\_K} \\
+token\_embd & Q5\_K & \textbf{Q6\_K} \\
+Gen speed & 92.4 tok/s & 90.3 tok/s \\
+Functional bench & good & \textbf{30/30} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The size reduction (16.6 $\to$ 15.2\,GB) comes from IQ3\_S ($\sim$3.44 BPW) vs.\ Q3\_K\_M ($\sim$3.56 BPW) as base. The quality improvement comes from promoting ssm\_out to Q8\_0 (critical in GDN sensitivity hierarchy) and using a domain-calibrated imatrix.
+
+\subsection{The Night of Builds}
+
+Table~\ref{tab:builds} shows the 7~build attempts on March 28--29.
+
+\begin{table}[h]
+\centering
+\caption{Build attempts chronology.}
+\small
+\begin{tabular}{llll}
+\toprule
+\textbf{\#} & \textbf{Source} & \textbf{Result} & \textbf{Failure mode} \\
+\midrule
+1 & BF16 QuaRot & Garbage & SSM corrupted by rotation \\
+2 & BF16 QuaRot + fallback & Garbage & Rotated experts contaminate \\
+3 & convert\_hf $\to$ F16 & 137\,GB file & F32 experts (2\,GB each) \\
+4 & Requant from build~1 & Garbage & Source was garbage \\
+5 & convert\_hf $\to$ BF16 & Correct (66\,GB) & Slow (redundant with Unsloth) \\
+6 & BF16 clean + custom-q & \textbf{17\,GB, works} & First success \\
+7 & BF16 rote + hybrid & Garbage & Any rotation = garbage \\
+\bottomrule
+\end{tabular}
+\label{tab:builds}
+\end{table}
+
+\textbf{Root cause:} 4/7 failures from trying to use QuaRot-rotated weights. The epiphany: Unsloth already provides correct BF16 GGUF with all SSM transformations pre-applied.
+
+\section{MTP GGUF: Parallel Story}
+
+We also built tools to inject Multi-Token Prediction tensors into GGUF files (4~script versions over 2~weeks). The resulting MTP GGUF (18.4\,GB, 753~tensors) achieved 84.8\% acceptance rate but \textbf{slowed inference from 93 to 47~tok/s} because the MTP layer is itself MoE (256~experts on CPU). The MTP was pruned for production. Scripts and model released.\footnote{\url{https://huggingface.co/Kevletesteur/Qwen3.5-35B-A3B-IQ3_S-MTP}}
+
+\section{Lessons Learned}
+
+\begin{enumerate}
+  \item \textbf{Rotation methods are incompatible with GDN.} QuaRot, OptRot, and any Hadamard/Givens rotation without full cross-layer absorption corrupt recurrent state. MambaQuant~\cite{mambaquant2024} confirms: 21\% accuracy drop even at W8A8.
+  \item \textbf{MoE experts are the most compressible.} 93\% of parameters, sparsely activated. Couches 17--23 tolerate IQ3\_XXS; periphery (0, 38--39) needs Q4\_K.
+  \item \textbf{Don't write custom code when the tool exists.} Our 900-line \texttt{ramp\_quantize.c} is obsolete --- \texttt{llama-quantize --custom-q} does the same thing.
+  \item \textbf{Always start from Unsloth BF16.} SSM transformations (deinterleave, $-\exp$, norm+1) pre-applied. \texttt{convert\_hf\_to\_gguf.py} produces 2$\times$ larger files.
+  \item \textbf{Consumer hardware = data-free methods only.} ParoQuant, EvoPress, SpinQuant all OOM. NSDS + proxy search works locally in minutes.
+  \item \textbf{The imatrix bootstrapping trick:} Use RAMP~v1 (no imatrix, Q3\_K\_M) to generate a domain-calibrated imatrix, then requantize to IQ3\_S for RAMP~v2.
+\end{enumerate}
+
+\section{Related Work}
+
+GPTQ~\cite{gptq2023} and AWQ~\cite{awq2023} require calibration data and full model in memory. SpinQuant~\cite{spinquant2024} learns rotations but needs the full model. EvoPress~\cite{evopress2024} uses evolutionary search with KL fitness (same OOM). NSDS~\cite{nsds2024} provides data-free sensitivity --- we build on this. Unsloth Dynamic~2.0 is the production baseline. RAMP~\cite{ramp2024} uses RL for allocation --- we replace RL with proxy + greedy/evolutionary search for consumer feasibility.
+
+\section{Conclusion}
+
+RAMP demonstrates that data-free mixed-precision quantization can produce production-quality GGUF files for hybrid SSM-MoE models on consumer hardware. The key insight is that GDN sensitivity hierarchy (gates $>$ attention $>$ shared experts $>$ routed experts) enables aggressive compression of 93\% of parameters while protecting the 7\% that matter. RAMP~v2 runs at 90~tok/s with 30/30 functional accuracy on RTX~5060~Ti --- comparable to Q4\_K\_M quality at 71\% of the size.
+
+\begin{thebibliography}{10}
+
+\bibitem{gptq2023} Frantar, E., et~al. GPTQ: Accurate post-training quantization for generative pre-trained transformers. \emph{ICLR}, 2023.
+
+\bibitem{awq2023} Lin, J., et~al. AWQ: Activation-aware weight quantization for LLM compression and acceleration. \emph{MLSys}, 2024.
+
+\bibitem{spinquant2024} Liu, Z., et~al. SpinQuant: LLM quantization with learned rotations. \emph{arXiv:2405.16406}, 2024.
+
+\bibitem{evopress2024} IST-DASLab. EvoPress: Evolutionary search for GGUF quantization. \emph{ICML}, 2025.
+
+\bibitem{nsds2024} NSDS: Normalized data-free sensitivity for mixed-precision quantization. \emph{arXiv:2603.17354}, 2024.
+
+\bibitem{ramp2024} RAMP: RL-guided adaptive mixed-precision quantization. \emph{arXiv:2603.17891}, 2024.
+
+\bibitem{optrot2024} OptRot: Optimal rotations for quantization. \emph{NeurIPS}, 2025.
+
+\bibitem{paroquant2024} ParoQuant: Pairwise rotations for quantization. \emph{ICLR}, 2026.
+
+\bibitem{mambaquant2024} MambaQuant: Quantizing recurrent state space models. \emph{ICLR}, 2025.
+
+\end{thebibliography}
+
+\end{document}

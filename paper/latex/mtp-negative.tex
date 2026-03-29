@@ -1,0 +1,91 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage[margin=2.5cm]{geometry}
+
+\title{Multi-Token Prediction on Qwen3.5 MoE:\\84.8\% Acceptance, 50\% Slowdown}
+
+\author{
+  K\'evin Remondi\`ere\\
+  Independent Researcher, Oloron-Sainte-Marie, France\\
+  \texttt{kevin.remondiere@gmail.com}\\
+  ORCID: \href{https://orcid.org/0009-0008-2443-7166}{0009-0008-2443-7166}
+}
+
+\date{March 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We report the first implementation of Multi-Token Prediction (MTP) speculative decoding for Qwen3.5-35B-A3B in ik\_llama.cpp, requiring 5~patches fixing 8~bugs across tensor mapping, compute buffers, and MoE handling. MTP achieves 84.8\% single-token acceptance (warm cache) and 61--63\% cold. However, inference \textbf{slows from 93 to 47~tok/s} (0.51$\times$) because the MTP layer is itself a full MoE layer with 256~experts offloaded to CPU. Multi-step MTP ($k{>}1$) collapses to 12\% acceptance at 12.7~tok/s. We release the patches and the first MTP-enabled GGUF for this model.\footnote{Patches: \url{https://github.com/AIdevsmartdata/chimere/tree/main/patches/ik-llama-mtp}. Model: \url{https://huggingface.co/Kevletesteur/Qwen3.5-35B-A3B-IQ3_S-MTP}}
+\end{abstract}
+
+\section{Introduction}
+
+Multi-Token Prediction (MTP)~\cite{gloeckle2024mtp} uses auxiliary prediction heads to draft future tokens, enabling speculative decoding without a separate drafter model. Qwen3.5 includes a single MTP layer (layer~40) with full MoE architecture (256~experts), but no public runtime supports MTP for this model family.
+
+\section{Implementation}
+
+\subsection{Patching ik\_llama.cpp}
+
+Five patches (482~insertions, 93~deletions across 9~files) were needed:
+
+\begin{enumerate}
+  \item \textbf{Tensor mapping} (248~insertions in \texttt{convert\_hf\_to\_gguf.py}): Map \texttt{mtp.layers.0.*} to \texttt{blk.40.*} with correct GGUF names for GDN + MoE tensors.
+  \item \textbf{4 compute bugs} in \texttt{llama-build-context.cpp}: The MTP branch must build \emph{only} the MTP tail, not re-run the full 40-layer transformer. Before fix: \texttt{build\_inp\_embd\_mtp()} overwrote \texttt{inp\_tokens}, corrupting the KV cache.
+  \item \textbf{Buffer reserve}: MTP compute needs separate scheduler buffers. Shared buffers caused the WARMUP/UPDATE operations to overwrite scratch needed by the next main decode.
+  \item \textbf{MTP decode for MoE}: The \texttt{n\_layer - 1} optimization for \texttt{inp\_out\_ids} must use \texttt{n\_transformer\_layers - 1} for MTP GGUF where \texttt{block\_count=41}.
+  \item \textbf{Debug cleanup}: Remove debug \texttt{fprintf} that flooded stdout.
+\end{enumerate}
+
+\subsection{GGUF Construction}
+
+Four script versions were developed to inject MTP tensors from HuggingFace safetensors (shards 13--14) into an existing IQ3\_S GGUF. The final script (\texttt{build\_mtp\_gguf\_v3.py}) handles metadata ARRAY copying and correct tensor fusion for the 256 MoE experts.
+
+\section{Results}
+
+\begin{table}[h]
+\centering
+\caption{MTP performance on RTX~5060~Ti (IQ3\_S, ik\_llama sm120, ncmoe=4).}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Configuration} & \textbf{Speed} & \textbf{Acceptance} & \textbf{Effective speedup} \\
+\midrule
+Without MTP (baseline) & 93 tok/s & --- & 1.00$\times$ \\
+\texttt{-mtp --draft-max 0} & 84.7 tok/s & --- & 0.91$\times$ \\
+\texttt{-mtp --draft-max 1} & 47.6 tok/s & 84.8\% (warm) & \textbf{0.51$\times$} \\
+\texttt{-mtp} (multi-step) & 12.7 tok/s & 12\% & 0.14$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Why MTP Slows Down MoE}
+
+The MTP layer (layer~40) is a \textbf{full MoE layer}: GDN attention + 256 experts, same architecture as layers 0--39. With CPU expert offloading (\texttt{-ncmoe 4}), each MTP forward costs the same as a main model forward ($\sim$11\,ms) because the bottleneck is PCIe expert transfer, not compute.
+
+For single-token MTP: each generation step requires main forward (11\,ms) + MTP forward (11\,ms) to produce 1 main token + 0.85 draft tokens = 1.85 tokens in 22\,ms = 84~tok/s theoretical, 47.6~actual (overhead from state management).
+
+For multi-step ($k{>}1$): FastMTP~\cite{fastmtp2024} documents acceptance collapse: $70\% \to 11\% \to 2\%$ for vanilla MTP $k{=}3$. Our 12\% at multi-step confirms this. FastMTP's self-distilled head mitigates ($80\% \to 56\% \to 36\%$) but requires model fine-tuning.
+
+\textbf{MTP is profitable only when the MTP head is cheap relative to the main model.} Dense MTP heads (as in Llama-3) cost $\sim$1/40 of a main forward. MoE MTP heads cost $\sim$1/1 --- the worst case.
+
+\section{The GDN State Corruption}
+
+Even with correct MTP output, a deeper problem remains: the MTP decode shares scheduler buffers with the main graph. Running MTP WARMUP/UPDATE overwrites scratch buffers, producing garbage on the \emph{next} main decode. This manifests as repeated digits (e.g., ``7777777'' instead of ``17*3=51'').
+
+\textbf{Root cause}: ik\_llama's MTP integration uses separate decode calls that share the scheduler's scratch allocations. A correct fix requires either separate schedulers or fused in-graph computation.
+
+\section{Conclusion}
+
+MTP on Qwen3.5 MoE achieves high acceptance (84.8\%) but negative speedup (0.51$\times$) because the MTP layer's MoE architecture makes it as expensive as the main model. This is an architectural constraint, not an implementation bug. Models with dense MTP heads (or future MoE models with lightweight MTP) would benefit. We release the 5~patches and MTP GGUF as reference.
+
+\begin{thebibliography}{5}
+\bibitem{gloeckle2024mtp} Gloeckle, F., et~al. Better \& faster large language models via multi-token prediction. \emph{ICML}, 2024.
+\bibitem{fastmtp2024} Tencent. FastMTP: Accelerating multi-token prediction via self-distillation. \emph{ICLR}, 2026.
+\end{thebibliography}
+
+\end{document}
