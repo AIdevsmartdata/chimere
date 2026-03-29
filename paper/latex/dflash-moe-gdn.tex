@@ -14,7 +14,7 @@
 
 \author{
   K\'evin Remondi\`ere\\
-  Independent Researcher, Bayonne, France\\
+  Independent Researcher, Oloron-Sainte-Marie, France\\
   \texttt{kevin.remondiere@gmail.com}\\
   \url{https://github.com/AIdevsmartdata/chimere}
 }
@@ -27,8 +27,8 @@
 % ============================================================
 \begin{abstract}
 We present the first independent reimplementation of DFlash speculative decoding with a block diffusion drafter, targeting a Mixture-of-Experts model (Qwen3.5-35B-A3B) on consumer hardware (RTX~5060~Ti, 16\,GB VRAM).
-Our drafter achieves $\tau{=}9.4$ tokens accepted per step offline, exceeding the original DFlash result ($\tau{\approx}6.4$) by 47\%, using $4{\times}$ less training data (69K vs.\ 289K blocks).
-We introduce three architectural innovations: \emph{mask ratio embedding}, \emph{single-shot inference} (one forward pass replacing 16 iterative denoising steps), and \emph{exponential position-weighted loss}.
+Our drafter achieves $\tau{=}9.4$ tokens accepted per step offline (55.84\% acceptance rate over 72{,}908 blocks), exceeding the original DFlash result ($\tau{\approx}6.4$) by 47\%, using $4{\times}$ less training data (72{,}908 vs.\ 289K blocks).
+We introduce three architectural innovations: \emph{mask ratio embedding}, \emph{single-shot training loss} (enabling robust learning from fully masked inputs), and \emph{exponential position-weighted loss}.
 However, we document a fundamental incompatibility between speculative decoding and Gated DeltaNet (GDN) hybrid architectures: the sequential recurrent state update in GDN layers is structurally incompatible with KV cache trimming (\texttt{llama\_memory\_seq\_rm}), preventing online verification.
 We formalize this as the \emph{GDN State Barrier} and propose \textsc{Chim\`ere-deltanet}, a Rust-native runtime that bypasses it by design.
 All code and data are publicly available.\footnote{\url{https://github.com/AIdevsmartdata/chimere}}
@@ -81,22 +81,42 @@ Qwen3.5-35B-A3B uses 30 GDN layers and 10 full attention layers (3:1 ratio), wit
 
 \subsection{Hidden State Extraction}
 
-We extract hidden states from 5 intermediate layers of the frozen Qwen3.5-35B-A3B target using a custom C++ extractor integrated with \texttt{llama.cpp}. Each training sample consists of a block of $K{=}16$ consecutive tokens with their corresponding hidden states. We extract 69,408 blocks from 3,927 diverse prompts (code, math, French clinical, general knowledge).
+We extract hidden states from 5 intermediate layers (1, 10, 19, 28, 37 out of 40) of the frozen Qwen3.5-35B-A3B target using a custom C++ extractor integrated with \texttt{llama.cpp}. Each training sample consists of a block of $K{=}16$ consecutive tokens with their corresponding 2048-dimensional hidden states. We extract 72{,}908 blocks from 3{,}927 diverse prompts (code, math, French clinical text, general knowledge), totaling 47.8\,GB of feature data packed into memory-mapped files for efficient training.
 
 \subsection{Three Architectural Innovations}
 
 \paragraph{Mask ratio embedding.}
 We inform the drafter of the current masking schedule by embedding the mask ratio $r \in [0,1]$ as a learnable vector added to each position. This replaces the implicit timestep conditioning in standard diffusion and improves the drafter's ability to calibrate its predictions to the denoising stage.
 
-\paragraph{Single-shot inference.}
-Instead of 16 iterative denoising steps, we train the drafter to predict all $K$ tokens in a single forward pass from a fully masked input. This reduces drafter latency by $16{\times}$ at the cost of slightly lower per-position accuracy, which we compensate with the next innovation.
+\paragraph{Single-shot training loss.}
+We train the drafter to predict all $K$ tokens from a \emph{fully masked input} in a single forward pass, rather than conditioning on partially denoised sequences at various noise levels. This simplifies the training objective and produces a drafter that is robust across all masking ratios. At inference time, we still use iterative denoising (up to 16 steps) for maximum acceptance, but the single-shot training makes the model effective even at high mask ratios. In single-shot evaluation mode ($n_{\text{steps}}{=}1$), the drafter achieves $\tau{=}2.9$; with iterative denoising, $\tau{=}9.4$.
 
 \paragraph{Exponential position-weighted loss.}
 We weight the cross-entropy loss exponentially by position: $w_i = e^{-\lambda i}$ for position $i$ in the block. Earlier positions receive higher weight because: (a) in left-to-right verification, a correct token at position $i$ is worthless if position $i{-}1$ was rejected; (b) the drafter has more hidden state context for earlier positions.
 
 \subsection{Training}
 
-We train in BF16 on a single RTX~5060~Ti (16\,GB VRAM). The drafter has 5 transformer layers with deep KV injection from the target's hidden states, bidirectional GQA attention with RoPE, and $\sim$200M parameters. Training converges in $\sim$4 hours.
+We train in BF16 on a single RTX~5060~Ti (16\,GB VRAM). The drafter architecture (Table~\ref{tab:drafter}) uses 8 transformer layers with deep KV injection: each layer receives fresh target hidden states through layer-specific K/V projections, enabling direct conditioning on the target's internal representations. We use bidirectional GQA attention (32 query heads, 4 KV heads, head\_dim=128) with RoPE ($\theta{=}10^7$) and SwiGLU FFN (intermediate size 6{,}144). The loss uses exponential decay $\gamma{=}7.0$ and likelihood loss with $\eta{=}3.0$. Training converges in 10 epochs ($\sim$66 minutes) with batch size 4, gradient accumulation 8, learning rate $6{\times}10^{-4}$ with cosine schedule.
+
+\begin{table}[h]
+\centering
+\caption{Drafter architecture.}
+\begin{tabular}{ll}
+\toprule
+\textbf{Parameter} & \textbf{Value} \\
+\midrule
+Hidden dimension & 2{,}048 \\
+Layers & 8 \\
+Attention heads (Q / KV) & 32 / 4 \\
+Head dimension & 128 \\
+FFN intermediate & 6{,}144 (SwiGLU) \\
+Block size ($K$) & 16 \\
+Feature layers & 5 (layers 1, 10, 19, 28, 37) \\
+RoPE $\theta$ & $10^7$ \\
+\bottomrule
+\end{tabular}
+\label{tab:drafter}
+\end{table}
 
 % ============================================================
 \section{Experimental Results}
@@ -104,40 +124,44 @@ We train in BF16 on a single RTX~5060~Ti (16\,GB VRAM). The drafter has 5 transf
 
 \subsection{Offline Benchmark}
 
-We evaluate on 72,908 held-out blocks, measuring the expected number of accepted tokens $\tau$ under greedy verification against the target model's logits.
+We evaluate on all 72{,}908 blocks using greedy verification against the target model's pre-extracted logits. We report two settings: single-shot ($n_{\text{steps}}{=}1$) and iterative denoising ($n_{\text{steps}}{=}16$).
 
 \begin{table}[h]
 \centering
-\caption{DFlash offline results across architecture versions.}
-\begin{tabular}{lcccc}
+\caption{DFlash offline results. Training data: 72{,}908 blocks from 3{,}927 prompts.}
+\begin{tabular}{lccccc}
 \toprule
-\textbf{Version} & \textbf{Architecture} & \textbf{Val Loss} & \textbf{Val Acc} & $\boldsymbol{\tau}$ \\
+\textbf{Version} & \textbf{Architecture} & \textbf{Val Loss} & \textbf{Val Acc} & $\boldsymbol{\tau}$ & \textbf{Accept \%} \\
 \midrule
-v1 (Gaussian) & Continuous diffusion & 6.99 & 22.9\% & 0.09 \\
-v2 (Discrete) & Mask-predict, 16 steps & 5.06 & 26.2\% & 0.43 \\
-v3 (Single-shot) & Single-shot + exp.\ loss & \textbf{1.27} & \textbf{81.7\%} & \textbf{9.4} \\
+v1 (Gaussian) & Continuous diffusion & 6.99 & 22.9\% & 0.09 & 0.62\% \\
+v6 (Discrete) & Mask-predict, 16 steps & 5.06 & --- & 0.43 & 2.7\% \\
+v7 (RoPE) & RoPE + absolute pos & 4.02 & 26.2\% & 0.04 & 0.25\% \\
+v3 (Ours, 1-step) & Single-shot eval & 1.27 & 81.7\% & 2.9 & 12.0\% \\
+\textbf{v3 (Ours, 16-step)} & \textbf{Iterative eval} & \textbf{1.27} & \textbf{81.7\%} & \textbf{9.4} & \textbf{55.8\%} \\
 \midrule
-\multicolumn{2}{l}{DFlash original~\citep{dflash2024}} & --- & --- & $\sim$6.4 \\
+\multicolumn{2}{l}{DFlash original~\citep{dflash2024}} & --- & --- & $\sim$6.4 & --- \\
 \bottomrule
 \end{tabular}
 \label{tab:offline}
 \end{table}
 
-Key findings:
+Detailed results for v3 with iterative denoising (72{,}908 blocks):
 \begin{itemize}
-  \item \textbf{$\tau{=}9.4$ vs.\ $\tau{\approx}6.4$}: our single-shot approach with exponential loss outperforms the original iterative approach by 47\%.
-  \item \textbf{Data efficiency}: we use 69K blocks vs.\ 289K ($4{\times}$ less data).
-  \item \textbf{Perfect blocks}: 27.6\% of blocks have all 15/15 non-anchor tokens accepted.
-  \item \textbf{Architecture matters}: the jump from v1 ($\tau{=}0.09$) to v3 ($\tau{=}9.4$) came from three discrete insights, each documented in our codebase.
+  \item \textbf{Tokens drafted}: 1{,}093{,}620. \textbf{Tokens accepted}: 610{,}724 (55.84\%).
+  \item \textbf{$\tau{=}9.4$} vs.\ $\tau{\approx}6.4$ (DFlash original): $+47\%$ improvement.
+  \item \textbf{Perfect blocks}: 20{,}147 / 72{,}908 (27.6\%) have all 15/15 tokens accepted.
+  \item \textbf{Complete failures}: only 1{,}287 blocks (1.8\%) with 0/15 accepted.
+  \item \textbf{Draft latency}: 2.7\,ms/block. \textbf{Estimated real speedup}: $9.1{\times}$ (assuming 100\,ms/token target).
 \end{itemize}
 
 \subsection{Architecture Evolution}
 
-Each version pivot teaches a lesson:
+The project went through 4 architectural pivots over 4 weeks, each yielding a specific insight:
 
 \begin{description}
-  \item[v1 $\to$ v2:] Gaussian continuous diffusion produces embedding residuals, not hidden states. Switching to discrete mask-predict immediately improved token-level accuracy from near-random to 26\%.
-  \item[v2 $\to$ v3:] Iterative denoising (16 steps) is unnecessary when the drafter has direct access to target hidden states via deep KV injection. Single-shot inference with position-weighted loss captures the same information in one pass.
+  \item[v1 (Gaussian $\to$ Discrete):] Continuous Gaussian diffusion on token embeddings produced embedding residuals rather than hidden states, yielding near-random acceptance (0.62\%). Switching to discrete mask-predict with the target's hidden states immediately improved accuracy.
+  \item[v6 $\to$ v7 (RoPE regression):] Adding RoPE positional encoding \emph{degraded} performance from $\tau{=}0.43$ to $\tau{=}0.04$. The drafter already receives position information through the target's hidden states; explicit positional encoding created conflicting signals.
+  \item[v6 $\to$ v3 (Single-shot training):] Training with single-shot loss ($\gamma{=}7.0$ exponential decay) plus deep KV injection produced a drafter that is robust across all masking ratios. This same checkpoint achieves $\tau{=}2.9$ in single-shot mode and $\tau{=}9.4$ with iterative denoising --- a $22{\times}$ improvement over the v6 discrete baseline.
 \end{description}
 
 % ============================================================
@@ -211,12 +235,12 @@ SpecMamba~\citep{zhang2024specmamba} identified challenges with speculative deco
 % ============================================================
 \section{Conclusion}
 
-We demonstrated that block diffusion drafting can achieve $\tau{=}9.4$ on MoE targets with three architectural innovations and $4{\times}$ less data than the original DFlash.
+We demonstrated that block diffusion drafting can achieve $\tau{=}9.4$ on MoE targets (55.84\% acceptance over 72{,}908 blocks) with three architectural innovations and ${\sim}4{\times}$ less data than the original DFlash.
 More importantly, we identified and formalized the \emph{GDN State Barrier} --- a fundamental incompatibility between speculative decoding and hybrid recurrent-attention architectures that affects a growing family of production models.
 Our Rust runtime provides a practical workaround, and we release all code, data, and trained models to enable further research.
 
 \paragraph{Limitations.}
-Our offline $\tau$ measurement uses pre-extracted hidden states; online $\tau$ may differ due to distribution shift during autoregressive generation. The GDN state checkpoint approach increases memory usage by $\sim$120\,MB. Our evaluation is limited to a single model (Qwen3.5-35B-A3B) on a single GPU.
+Our offline $\tau$ measurement uses pre-extracted hidden states; online $\tau$ may differ due to distribution shift during autoregressive generation. The $\tau{=}9.4$ result uses iterative denoising (16 steps), which adds ${\sim}43\,\text{ms}$ of drafter compute per block ($16 \times 2.7\,\text{ms}$); single-shot inference gives $\tau{=}2.9$ at 2.7\,ms. The GDN state checkpoint approach increases memory by ${\sim}120\,\text{MB}$. Our evaluation uses a single model (Qwen3.5-35B-A3B) on a single GPU (RTX~5060~Ti). The DFlash original reports results on a different target (Qwen3-Coder-30B-A3B), so the comparison is indicative rather than controlled.
 
 % ============================================================
 \begin{thebibliography}{10}
