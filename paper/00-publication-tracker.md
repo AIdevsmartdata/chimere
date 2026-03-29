@@ -1,65 +1,62 @@
-# Chimère Publication Tracker — Mars 2026
+# Chimere Publication Tracker — Mars 2026
 
-## Papers par priorité
+*Mis a jour le 30 mars apres verification complete des donnees.*
 
-| # | Paper | Novelty | Prêt | Venue cible | Status |
+## Papers par priorite
+
+| # | Paper | Novelty | Pret | Venue cible | Status |
 |---|-------|---------|------|-------------|--------|
-| 1 | **Chimère System Paper** | ★★★★ | 80% | MLSys/OSDI/arXiv | Outline done |
-| 2 | **DFlash MoE + GDN Barrier** | ★★★★ | 75% | NeurIPS Workshop | Outline done |
-| 3 | **Engram Multi-Tier Consumer HW** | ★★★★ | 60% | EMNLP Demo | TODO |
-| 4 | **Self-Improving Quality Loop** | ★★★ | 70% | AAAI AI-HRI | TODO |
-| 5 | **Expert Prefetch Negative Result** | ★★★ | 85% | Negative Results Workshop | TODO |
-| 6 | **ABF Quantized Reasoning Budget** | ★★★ | 50% | arXiv short | TODO |
-| 7 | **Entropy Router AR↔Diffusion** | ★★★★★ | 30% | ICML (when implemented) | Concept only |
+| 1 | **DFlash MoE + GDN State Barrier** | ★★★★ | **90%** | NeurIPS Workshop / arXiv | **.tex REECRIT, toutes donnees verifiees** |
+| 2 | **Chimere System Paper** | ★★★★ | 75% | arXiv / MLSys | .tex ecrit, a enrichir avec history-system |
+| 3 | **RAMP Mixed-Precision Quantization** | ★★★★ | 70% | arXiv | histoire reconstituee, .tex a ecrire |
+| 4 | **Engram Multi-Tier Consumer HW** | ★★★★ | 60% | EMNLP Demo | ablation mesuree (77→85→88%) |
+| 5 | **MTP on Qwen3.5 MoE (negative)** | ★★★ | 70% | arXiv note | 84.8% acceptance, 93→47 tok/s |
+| 6 | **Expert Prefetch (negative)** | ★★★ | 85% | Workshop | 86.65% hit@8, zero speedup |
+| 7 | **ODO Unified Orchestrator** | ★★★ | 60% | arXiv | code publie |
+| 8 | **chimere-deltanet Rust Runtime** | ★★★★ | 65% | MLSys / arXiv | 56K lignes Rust |
 
-## Paper 1: Chimère System Paper
-- **File:** 01-chimere-system-paper-outline.md
-- **Key result:** 10/10 benchmark, 93 tok/s, $0.10/day, self-improving
-- **What's missing:** 30-day longitudinal data, formal ablation study
-- **Estimated effort:** 2 weeks writing + 1 month data collection
+## Corrections critiques (30 mars, post-verification)
 
-## Paper 2: DFlash MoE + GDN Barrier
-- **File:** 02-dflash-moe-gdn-barrier-outline.md
-- **Key result:** τ=9.4 > paper's 6.4 (+47%), GDN state barrier formalized
-- **What's missing:** Formalize GDN/seq_rm proof, minimal reproducer
-- **Data available:** 72,908 blocks evaluated, training curves, 4 architecture versions
-- **Estimated effort:** 1 week writing (data exists)
+### DFlash paper — CORRIGE
+- **AVANT** : tau=9.4 (+47% vs DFlash) presente comme resultat principal
+- **APRES** : tau=9.4 = train set (biaise). **Holdout tau=6.06** (v8 deepKV, comparable au paper original). **Wall-clock = 0.73x** (ralentissement, pas acceleration)
+- 8 architectures, 7 extracteurs C++, 20 nightly runs — tout documente
+- Nouveau titre : "Eight Architectures, One Structural Barrier"
 
-## Paper 3: Engram Multi-Tier for Consumer Hardware
-- **Key result:** 4-tier Engram (Cuckoo → FAISS → N-gram → FHRR), 20MB kine table, O(1)+<10ns
-- **Novel:** Multi-tier extension of DeepSeek Engram with domain routing
-- **What's missing:** Ablation (with/without each tier), perplexity impact measurement
-- **Estimated effort:** 1 week ablation + 1 week writing
+### System paper — A ENRICHIR
+- Benchmark 10/10 = smoke test (10 questions) → discute dans limitations
+- Engram ablation verifiee : v1 77% → OFF 85% → v2 88%
+- 104 quality scores (mean 3.04/5), 68 training pairs — verifie
+- A integrer : sprint perf 9.1→93 tok/s, 7 bugs critiques, 8 dead ends
 
-## Paper 4: Self-Improving Quality Loop
-- **Key result:** ThinkPRM scoring → training pairs → nightly LoRA/SPIN → Engram WRITE
-- **Novel:** The model improves from production Telegram conversations while sleeping
-- **What's missing:** 30+ days longitudinal data showing quality improvement
-- **Estimated effort:** 1 month passive data + 1 week writing
+### RAMP paper — A ECRIRE
+- 7 builds en une nuit, 4 echecs
+- QuaRot PPL 49524 (dead end), OptRot/ParoQuant explosent
+- RAMP-v2 : 15.2 GB, 3.78 BPW, 90 tok/s, 30/30 bench
 
-## Paper 5: Expert Prefetch — Informative Negative Result
-- **Key result:** MLP predictor 86.65% hit@8, but prefetch USELESS (CPU GEMV < 45% budget)
-- **Novel:** Shows that expert prefetch is counter-productive on current hardware
-- **Data available:** Trained predictor, A/B benchmarks, timing breakdown
-- **Estimated effort:** 3 days writing (all data exists)
+## Histoires detaillees (Bureau, pour redaction)
 
-## Paper 6: ABF — Adaptive Budget Forcing for Quantized Reasoning
-- **Key result:** ABF + CGRS + entropy routing save 15-30% thinking tokens
-- **Novel:** Budget forcing adapted for quantized MoE with quality gate feedback
-- **What's missing:** Formal benchmarks (MATH, GSM8K) with/without ABF
-- **Estimated effort:** 1 week benchmarks + 1 week writing
+| Fichier | Taille | Contenu |
+|---------|--------|---------|
+| `paper-history-dflash.md` | 37 KB | 8 versions, 27 jours, chaque echec |
+| `paper-history-system.md` | ~30 KB | 7 semaines, 9.1→93 tok/s, 8 dead ends |
+| `paper-history-ramp.md` | 35 KB | 20+ configs testees, 7 builds |
 
-## Paper 7: Entropy Router AR↔Diffusion (MOST NOVEL)
-- **Key result:** No paper exists implementing this (confirmed Mar 2026)
-- **Novel:** Route individual tokens between AR and block diffusion by Shannon entropy
-- **What's missing:** Full implementation (DFlash drafter integration needed)
-- **Estimated effort:** 1 month implementation + 2 weeks writing
-- **Impact:** Could be the standout contribution if results are strong
+## Code et donnees publies
 
----
+### GitHub (public)
+- [chimere](https://github.com/AIdevsmartdata/chimere) — 96K lignes (Rust+Python+CUDA)
+- [chimere-odo](https://github.com/AIdevsmartdata/chimere-odo) — 17K lignes (Python)
+- [ramp-quant](https://github.com/AIdevsmartdata/ramp-quant) — 9K lignes (Python+C)
 
-## Shared Resources
-- Hardware: RTX 5060 Ti 16GB, i5-14600KF, 32GB DDR5
-- Model: Qwen3.5-35B-A3B IQ3_S custom-mix (14.71 GB)
-- Codebase: chimere-rewrite (Rust), Chimère (Python)
-- All code open-source ready
+### HuggingFace
+- [RAMP-v2-15G](https://huggingface.co/Kevletesteur/Qwen3.5-35B-A3B-RAMP-v2-15G) — GGUF 15.2 GB + imatrix
+- [IQ3_S-MTP](https://huggingface.co/Kevletesteur/Qwen3.5-35B-A3B-IQ3_S-MTP) — GGUF 11 GB avec tenseurs MTP
+- [chimere-dflash-data](https://huggingface.co/Kevletesteur/chimere-dflash-data) — prompts d'entrainement
+- [chimere-quality-scores](https://huggingface.co/datasets/Kevletesteur/chimere-quality-scores) — scores + pairs
+- [chimere-engram-tables](https://huggingface.co/datasets/Kevletesteur/chimere-engram-tables) — tables n-gram
+- [chimere-expert-predictor](https://huggingface.co/datasets/Kevletesteur/chimere-expert-predictor) — 4 modeles
+
+## Hardware
+- RTX 5060 Ti 16GB (Blackwell, sm_120), i5-14600KF, 32GB DDR5
+- Total cost: ~$0.10/day electricity
