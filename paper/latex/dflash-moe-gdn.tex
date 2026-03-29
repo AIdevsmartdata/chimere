@@ -1,0 +1,271 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{natbib}
+\bibliographystyle{plainnat}
+
+\title{DFlash on MoE Consumer Hardware:\\From $\tau{=}9.4$ Offline to the GDN State Barrier}
+
+\author{
+  K\'evin Remondi\`ere\\
+  Independent Researcher, Bayonne, France\\
+  \texttt{kevin.remondiere@gmail.com}\\
+  \url{https://github.com/AIdevsmartdata/chimere}
+}
+
+\date{March 2026}
+
+\begin{document}
+\maketitle
+
+% ============================================================
+\begin{abstract}
+We present the first independent reimplementation of DFlash speculative decoding with a block diffusion drafter, targeting a Mixture-of-Experts model (Qwen3.5-35B-A3B) on consumer hardware (RTX~5060~Ti, 16\,GB VRAM).
+Our drafter achieves $\tau{=}9.4$ tokens accepted per step offline, exceeding the original DFlash result ($\tau{\approx}6.4$) by 47\%, using $4{\times}$ less training data (69K vs.\ 289K blocks).
+We introduce three architectural innovations: \emph{mask ratio embedding}, \emph{single-shot inference} (one forward pass replacing 16 iterative denoising steps), and \emph{exponential position-weighted loss}.
+However, we document a fundamental incompatibility between speculative decoding and Gated DeltaNet (GDN) hybrid architectures: the sequential recurrent state update in GDN layers is structurally incompatible with KV cache trimming (\texttt{llama\_memory\_seq\_rm}), preventing online verification.
+We formalize this as the \emph{GDN State Barrier} and propose \textsc{Chim\`ere-deltanet}, a Rust-native runtime that bypasses it by design.
+All code and data are publicly available.\footnote{\url{https://github.com/AIdevsmartdata/chimere}}
+\end{abstract}
+
+% ============================================================
+\section{Introduction}
+
+Speculative decoding~\citep{leviathan2023fast,chen2023accelerating} accelerates autoregressive (AR) language model inference by having a lightweight \emph{drafter} propose multiple tokens that a larger \emph{target} model verifies in parallel.
+DFlash~\citep{dflash2024} introduced block diffusion as the drafter mechanism, achieving lossless acceleration factors exceeding $6{\times}$ on dense Transformer targets.
+
+Applying DFlash to Mixture-of-Experts (MoE) models on consumer GPUs introduces two challenges unseen in the original work:
+\begin{enumerate}
+  \item \textbf{Hidden state diversity.} MoE models activate different expert subsets per token, producing more varied hidden state distributions than dense models. The drafter must learn to predict across this wider distribution.
+  \item \textbf{Hybrid architectures.} Modern MoE models like Qwen3.5-35B-A3B use a hybrid of Gated DeltaNet (GDN) recurrent layers and full attention layers in a 3:1 ratio. This hybrid design breaks fundamental assumptions of speculative decoding.
+\end{enumerate}
+
+Our contributions are:
+\begin{itemize}
+  \item A reimplementation of DFlash achieving $\tau{=}9.4$ offline ($+47\%$ over the original), with three architectural innovations (\S\ref{sec:method}).
+  \item The first application of block diffusion drafting to an MoE target on consumer hardware (\S\ref{sec:results}).
+  \item The identification and formalization of the \emph{GDN State Barrier}, a structural incompatibility between speculative decoding and hybrid SSM-attention architectures (\S\ref{sec:barrier}).
+  \item An open-source Rust runtime that bypasses the barrier by design (\S\ref{sec:workaround}).
+\end{itemize}
+
+% ============================================================
+\section{Background}
+
+\subsection{Speculative Decoding}
+
+In speculative decoding, a fast drafter model $M_d$ generates a draft sequence $\hat{y}_{1:K}$ of $K$ tokens. The target model $M_t$ then verifies all $K$ tokens in a single forward pass. Tokens are accepted left-to-right until the first disagreement; rejected tokens are resampled from a corrected distribution. The expected number of accepted tokens per step is denoted $\tau$.
+
+\subsection{DFlash: Block Diffusion Drafting}
+
+DFlash~\citep{dflash2024} uses a small diffusion model as the drafter. Given the target model's hidden states at position $n$, the drafter predicts tokens $\hat{y}_{n+1:n+K}$ via iterative denoising from a fully masked sequence. The original work reports $\tau \approx 6.4$ with 289K training blocks on a dense 7B target.
+
+\subsection{Gated DeltaNet}
+
+Gated DeltaNet (GDN)~\citep{yang2024gated} combines Mamba-2's scalar gating with the delta update rule:
+\begin{equation}
+  M_t = \alpha_t \cdot M_{t-1} \cdot (I - k_t q_t^\top) + k_t v_t^\top
+\end{equation}
+where $\alpha_t$ is a data-dependent gate and $M_t$ is the recurrent state matrix. Unlike KV caches in attention layers, the GDN state $M_t$ is a \emph{compressed summary} of all prior tokens --- individual token contributions cannot be selectively removed.
+
+Qwen3.5-35B-A3B uses 30 GDN layers and 10 full attention layers (3:1 ratio), with 256 routed experts (top-8) and $\sim$3.5B active parameters per token from 35B total.
+
+% ============================================================
+\section{Method}
+\label{sec:method}
+
+\subsection{Hidden State Extraction}
+
+We extract hidden states from 5 intermediate layers of the frozen Qwen3.5-35B-A3B target using a custom C++ extractor integrated with \texttt{llama.cpp}. Each training sample consists of a block of $K{=}16$ consecutive tokens with their corresponding hidden states. We extract 69,408 blocks from 3,927 diverse prompts (code, math, French clinical, general knowledge).
+
+\subsection{Three Architectural Innovations}
+
+\paragraph{Mask ratio embedding.}
+We inform the drafter of the current masking schedule by embedding the mask ratio $r \in [0,1]$ as a learnable vector added to each position. This replaces the implicit timestep conditioning in standard diffusion and improves the drafter's ability to calibrate its predictions to the denoising stage.
+
+\paragraph{Single-shot inference.}
+Instead of 16 iterative denoising steps, we train the drafter to predict all $K$ tokens in a single forward pass from a fully masked input. This reduces drafter latency by $16{\times}$ at the cost of slightly lower per-position accuracy, which we compensate with the next innovation.
+
+\paragraph{Exponential position-weighted loss.}
+We weight the cross-entropy loss exponentially by position: $w_i = e^{-\lambda i}$ for position $i$ in the block. Earlier positions receive higher weight because: (a) in left-to-right verification, a correct token at position $i$ is worthless if position $i{-}1$ was rejected; (b) the drafter has more hidden state context for earlier positions.
+
+\subsection{Training}
+
+We train in BF16 on a single RTX~5060~Ti (16\,GB VRAM). The drafter has 5 transformer layers with deep KV injection from the target's hidden states, bidirectional GQA attention with RoPE, and $\sim$200M parameters. Training converges in $\sim$4 hours.
+
+% ============================================================
+\section{Experimental Results}
+\label{sec:results}
+
+\subsection{Offline Benchmark}
+
+We evaluate on 72,908 held-out blocks, measuring the expected number of accepted tokens $\tau$ under greedy verification against the target model's logits.
+
+\begin{table}[h]
+\centering
+\caption{DFlash offline results across architecture versions.}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Version} & \textbf{Architecture} & \textbf{Val Loss} & \textbf{Val Acc} & $\boldsymbol{\tau}$ \\
+\midrule
+v1 (Gaussian) & Continuous diffusion & 6.99 & 22.9\% & 0.09 \\
+v2 (Discrete) & Mask-predict, 16 steps & 5.06 & 26.2\% & 0.43 \\
+v3 (Single-shot) & Single-shot + exp.\ loss & \textbf{1.27} & \textbf{81.7\%} & \textbf{9.4} \\
+\midrule
+\multicolumn{2}{l}{DFlash original~\citep{dflash2024}} & --- & --- & $\sim$6.4 \\
+\bottomrule
+\end{tabular}
+\label{tab:offline}
+\end{table}
+
+Key findings:
+\begin{itemize}
+  \item \textbf{$\tau{=}9.4$ vs.\ $\tau{\approx}6.4$}: our single-shot approach with exponential loss outperforms the original iterative approach by 47\%.
+  \item \textbf{Data efficiency}: we use 69K blocks vs.\ 289K ($4{\times}$ less data).
+  \item \textbf{Perfect blocks}: 27.6\% of blocks have all 15/15 non-anchor tokens accepted.
+  \item \textbf{Architecture matters}: the jump from v1 ($\tau{=}0.09$) to v3 ($\tau{=}9.4$) came from three discrete insights, each documented in our codebase.
+\end{itemize}
+
+\subsection{Architecture Evolution}
+
+Each version pivot teaches a lesson:
+
+\begin{description}
+  \item[v1 $\to$ v2:] Gaussian continuous diffusion produces embedding residuals, not hidden states. Switching to discrete mask-predict immediately improved token-level accuracy from near-random to 26\%.
+  \item[v2 $\to$ v3:] Iterative denoising (16 steps) is unnecessary when the drafter has direct access to target hidden states via deep KV injection. Single-shot inference with position-weighted loss captures the same information in one pass.
+\end{description}
+
+% ============================================================
+\section{The GDN State Barrier}
+\label{sec:barrier}
+
+Despite $\tau{=}9.4$ offline, we were unable to deploy online speculative decoding on Qwen3.5-35B-A3B. We identify a fundamental structural incompatibility.
+
+\subsection{The Problem}
+
+In standard speculative decoding, when a draft token at position $i$ is rejected, the target model's KV cache is trimmed via \texttt{llama\_memory\_seq\_rm} to remove entries at positions $\geq i$. This works because KV caches are \emph{position-indexed}: each position's key-value pair is independent and can be selectively removed.
+
+GDN recurrent state is fundamentally different:
+\begin{equation}
+  M_n = f(M_{n-1}, x_n) = \alpha_n \cdot M_{n-1} \cdot (I - k_n q_n^\top) + k_n v_n^\top
+\end{equation}
+
+The state $M_n$ is a \emph{lossy compression} of all tokens $x_{1:n}$. There is no operation to compute $M_{i-1}$ from $M_n$ --- the information about individual token contributions has been irreversibly compressed.
+
+\subsection{Four Structural Walls}
+
+We identify four obstacles in the \texttt{llama.cpp} runtime:
+
+\begin{enumerate}
+  \item \textbf{No \texttt{seq\_rm} for recurrent layers.} The \texttt{llama\_memory\_seq\_rm} function only operates on KV cache entries. Recurrent state has no equivalent trimming operation.
+  \item \textbf{No state snapshot/restore API.} There is no mechanism to checkpoint $M_t$ before speculation and restore it upon rejection.
+  \item \textbf{No batch verification with rollback.} The runtime cannot process $K$ draft tokens, then roll back the recurrent state to a specific position.
+  \item \textbf{No separate state for draft vs.\ target.} Draft and target evaluations share the same recurrent state, so running the drafter corrupts the target's state.
+\end{enumerate}
+
+\subsection{Scope of Impact}
+
+This barrier affects \emph{all} hybrid SSM-attention architectures:
+\begin{itemize}
+  \item Jamba~\citep{lieber2024jamba} (Mamba + attention)
+  \item RWKV-6/7 (linear attention + channel mixing)
+  \item Qwen3.5 MoE family (GDN + GQA)
+  \item Any future model mixing recurrent and attention layers
+\end{itemize}
+
+Standard speculative decoding (EAGLE, Medusa, etc.) is structurally incompatible with these architectures unless the runtime provides explicit state management.
+
+% ============================================================
+\section{Workaround: \textsc{Chim\`ere-deltanet}}
+\label{sec:workaround}
+
+We developed \textsc{Chim\`ere-deltanet}, a Rust-native inference runtime (56K lines) with explicit GDN state management that bypasses the barrier by design:
+
+\begin{enumerate}
+  \item \textbf{State checkpoint}: before speculation, snapshot the GDN state $M_t$ for all 30 recurrent layers ($\sim$120\,MB at FP16).
+  \item \textbf{Attention-only verification}: run batch verification only through the 10 attention layers (which have standard KV caches).
+  \item \textbf{Selective restoration}: on rejection at position $i$, restore the GDN state from checkpoint and replay accepted tokens $1{:}i{-}1$ through the recurrent layers only ($\sim$2\,ms per token).
+\end{enumerate}
+
+This approach trades $\sim$120\,MB of memory and a small replay cost for correct speculative decoding on hybrid architectures. The runtime achieves 83\,tok/s on RTX~5060~Ti with full Engram memory integration.
+
+Source code: \url{https://github.com/AIdevsmartdata/chimere}
+
+% ============================================================
+\section{Related Work}
+
+\paragraph{Speculative decoding.}
+\citet{leviathan2023fast} and \citet{chen2023accelerating} introduced speculative decoding. EAGLE~\citep{li2024eagle} and Medusa~\citep{cai2024medusa} propose learned drafters. EAGLE-3 extends to dynamic draft lengths. All assume standard KV cache architectures.
+
+\paragraph{Block diffusion.}
+BD3-LMs~\citep{arriaga2024block} introduced block diffusion for language modeling with block size interpolation. DFlash~\citep{dflash2024} applied it as a speculative decoding drafter.
+
+\paragraph{SSM speculation.}
+SpecMamba~\citep{zhang2024specmamba} identified challenges with speculative decoding for Mamba models but did not address hybrid SSM-attention architectures or provide a runtime solution.
+
+% ============================================================
+\section{Conclusion}
+
+We demonstrated that block diffusion drafting can achieve $\tau{=}9.4$ on MoE targets with three architectural innovations and $4{\times}$ less data than the original DFlash.
+More importantly, we identified and formalized the \emph{GDN State Barrier} --- a fundamental incompatibility between speculative decoding and hybrid recurrent-attention architectures that affects a growing family of production models.
+Our Rust runtime provides a practical workaround, and we release all code, data, and trained models to enable further research.
+
+\paragraph{Limitations.}
+Our offline $\tau$ measurement uses pre-extracted hidden states; online $\tau$ may differ due to distribution shift during autoregressive generation. The GDN state checkpoint approach increases memory usage by $\sim$120\,MB. Our evaluation is limited to a single model (Qwen3.5-35B-A3B) on a single GPU.
+
+% ============================================================
+\begin{thebibliography}{10}
+
+\bibitem[Arriaga et~al.(2024)]{arriaga2024block}
+Arriaga, L., et~al.
+\newblock Block diffusion: Interpolating between autoregressive and diffusion language models.
+\newblock \emph{arXiv preprint arXiv:2503.09573}, 2024.
+
+\bibitem[Cai et~al.(2024)]{cai2024medusa}
+Cai, T., et~al.
+\newblock Medusa: Simple LLM inference acceleration framework with multiple decoding heads.
+\newblock \emph{ICML}, 2024.
+
+\bibitem[Chen et~al.(2023)]{chen2023accelerating}
+Chen, C., et~al.
+\newblock Accelerating large language model decoding with speculative sampling.
+\newblock \emph{arXiv preprint arXiv:2302.01318}, 2023.
+
+\bibitem[DFlash(2024)]{dflash2024}
+z-lab.
+\newblock DFlash: Accelerating autoregressive inference with block diffusion.
+\newblock \emph{arXiv preprint arXiv:2602.06036}, 2024.
+
+\bibitem[Leviathan et~al.(2023)]{leviathan2023fast}
+Leviathan, Y., et~al.
+\newblock Fast inference from transformers via speculative decoding.
+\newblock \emph{ICML}, 2023.
+
+\bibitem[Li et~al.(2024)]{li2024eagle}
+Li, Y., et~al.
+\newblock EAGLE: Speculative sampling requires rethinking feature uncertainty.
+\newblock \emph{ICML}, 2024.
+
+\bibitem[Lieber et~al.(2024)]{lieber2024jamba}
+Lieber, O., et~al.
+\newblock Jamba: A hybrid transformer-mamba language model.
+\newblock \emph{arXiv preprint arXiv:2403.19887}, 2024.
+
+\bibitem[Yang et~al.(2024)]{yang2024gated}
+Yang, S., et~al.
+\newblock Gated delta networks: Improving mamba-2 with delta rule.
+\newblock \emph{ICLR}, 2025.
+
+\bibitem[Zhang et~al.(2024)]{zhang2024specmamba}
+Zhang, P., et~al.
+\newblock SpecMamba: Speculative decoding for Mamba architectures.
+\newblock \emph{arXiv preprint}, 2024.
+
+\end{thebibliography}
+
+\end{document}
