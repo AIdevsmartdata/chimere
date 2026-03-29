@@ -156,13 +156,41 @@ Detailed results for v3 with iterative denoising (72{,}908 blocks):
 
 \subsection{Architecture Evolution}
 
-The project went through 4 architectural pivots over 4 weeks, each yielding a specific insight:
+The project went through 8 architecture versions over 5 weeks (Feb~28 -- Mar~5, 2026), with 7 distinct C++ feature extractors and multiple training configurations. Table~\ref{tab:evolution} summarizes the complete trajectory.
+
+\begin{table}[h]
+\centering
+\caption{Complete architecture evolution. ``Frozen'' = frozen Qwen3.5 shared weights (embed\_tokens + lm\_head + output\_norm, 1{,}017M params).}
+\begin{tabular}{llrlrl}
+\toprule
+\textbf{Version} & \textbf{Date} & \textbf{Params} & \textbf{Val Loss} & $\boldsymbol{\tau}$ & \textbf{Key change} \\
+\midrule
+v1 & Feb 28 & $\sim$200M & 6.99 & 0.09 & Gaussian continuous diffusion \\
+v3 & Feb 28 & $\sim$200M & 1.27 & \textbf{9.4} & Single-shot + exp loss \\
+v5 & Mar 1 & 295M+1017M frozen & 3.80 & --- & Full-context KV injection \\
+v5-qwen & Mar 1 & 295M+1017M frozen & 4.43 & --- & +Qwen shared weights \\
+v5-residual & Mar 1 & 295M+1017M frozen & 4.10 & --- & +Residual connections \\
+v6 & Mar 2 & --- & 5.06 & 0.43 & New C++ extractor, discrete \\
+v7 & Mar 4 & --- & 4.02 & 0.04 & +RoPE (\textbf{regression}) \\
+v8 & Mar 5 & $\sim$300M & --- & --- & Deep KV, likelihood loss \\
+\bottomrule
+\end{tabular}
+\label{tab:evolution}
+\end{table}
+
+Key lessons from this trajectory:
 
 \begin{description}
-  \item[v1 (Gaussian $\to$ Discrete):] Continuous Gaussian diffusion on token embeddings produced embedding residuals rather than hidden states, yielding near-random acceptance (0.62\%). Switching to discrete mask-predict with the target's hidden states immediately improved accuracy.
-  \item[v6 $\to$ v7 (RoPE regression):] Adding RoPE positional encoding \emph{degraded} performance from $\tau{=}0.43$ to $\tau{=}0.04$. The drafter already receives position information through the target's hidden states; explicit positional encoding created conflicting signals.
-  \item[v6 $\to$ v3 (Single-shot training):] Training with single-shot loss ($\gamma{=}7.0$ exponential decay) plus deep KV injection produced a drafter that is robust across all masking ratios. This same checkpoint achieves $\tau{=}2.9$ in single-shot mode and $\tau{=}9.4$ with iterative denoising --- a $22{\times}$ improvement over the v6 discrete baseline.
+  \item[v1 $\to$ v3 (the breakthrough):] The overnight pipeline of Feb~28 produced $\tau{=}9.4$ by combining single-shot training (predict from fully masked input), exponential position-weighted loss ($\gamma{=}7.0$), and anchor token conditioning. The entire pipeline --- prompt generation, C++ extraction (66\,min), training (66\,min, 10~epochs), and benchmark --- completed in $\sim$4.5~hours unattended.
+
+  \item[v5 (frozen Qwen weights):] Adding the frozen Qwen3.5 embedding table and LM head (1{,}017M params in BF16) to the drafter increased total memory to $\sim$3.2\,GB GPU. The 295M trainable drafter parameters trained for 10~epochs ($\sim$13\,min/epoch) reaching val\_loss=3.80 with 50.8\% per-token accuracy. However, this \emph{did not translate} to better $\tau$ because: (a)~multiple training runs crashed with OOM on checkpoint resume (VRAM exhausted at 15.47\,GB), (b)~702 extracted feature samples contained NaN/Inf values and had to be skipped, and (c)~the Qwen shared weights improved loss but not left-to-right acceptance.
+
+  \item[v6 $\to$ v7 (RoPE regression):] Adding RoPE ($\theta{=}10^7$) alongside absolute positional information \emph{degraded} $\tau$ from 0.43 to 0.04 despite improving val\_loss from 5.06 to 4.02. The drafter receives position information implicitly through the target's hidden states; explicit RoPE created conflicting position signals that hurt sequential acceptance.
+
+  \item[v8 (final config):] 8~layers with deep KV injection from 5~target layers (1, 10, 19, 28, 37), bidirectional GQA (32/4 heads), SwiGLU FFN (6{,}144 intermediate), likelihood loss ($\eta{=}3.0$). This is the architecture used in the offline benchmark. Three checkpoint variants were produced: offline (IQ3\_S features), online (c5 context), and online-IQ3 (quantized + context).
 \end{description}
+
+The critical insight is that \textbf{better validation loss does not predict better $\tau$}. v7 has the best val\_loss (4.02) among discrete versions but the worst $\tau$ (0.04). The v3 single-shot training paradigm with exponential loss is what drives acceptance, not raw next-token accuracy.
 
 % ============================================================
 \section{The GDN State Barrier}
