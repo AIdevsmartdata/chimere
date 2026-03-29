@@ -211,13 +211,38 @@ This benchmark has 10 questions --- a smoke test, not a rigorous evaluation. We 
 
 \section{Related Work}
 
-KTransformers~(2024) addresses MoE offloading with CPU expert scheduling. DeepSeek Engram~(arXiv:2601.07372) introduces conditional memory for MoE. Autoresearch~(Karpathy, 2025) proposes self-improving research agents. DFlash~(arXiv:2602.06036) introduces block diffusion drafting. Our system integrates ideas from all of these into a coherent, deployable system on consumer hardware.
+\paragraph{MoE inference on consumer hardware.}
+KTransformers~(2024) addresses MoE offloading with CPU expert scheduling but provides no quality loop or orchestration.
+PowerInfer~\cite{powerinfer2024} and PowerInfer-2 use neuron-level GPU/CPU splitting for MoE, targeting cold-start latency.
+Ollama and LM~Studio provide easy deployment but no adaptive compute, no domain memory, no self-improvement.
+vLLM and TensorRT-LLM achieve high throughput but require A100+ hardware.
+
+\paragraph{Self-improving systems.}
+Autoresearch~(Karpathy, 2025) proposes self-improving research agents but remains a concept paper.
+Self-Play Fine-Tuning (SPIN)~\cite{spin2024} generates DPO pairs from the model's own outputs --- we use this for nightly training.
+DSPy~\cite{dspy2024} optimizes prompts via Bayesian search --- we run MIPROv2 weekly.
+STaR~(Zelikman et~al., 2022) bootstraps reasoning via self-taught rationalization.
+Our contribution is integrating these into a deployed loop that runs unattended on consumer hardware.
+
+\paragraph{Conditional memory.}
+DeepSeek Engram~(arXiv:2601.07372) adds conditional memory to MoE with +3.4~MMLU, requiring end-to-end training.
+We implement a lightweight inference-time approximation: N-gram hash lookup with logit biasing, achieving +3pp on our domain benchmark without any training.
+RAG systems (HippoRAG~2, Self-RAG, CRAG) inject knowledge via context; Engram injects at the logit level --- complementary approaches.
+
+\paragraph{Quantization.}
+GPTQ, AWQ, and SpinQuant require calibration data and full model in memory.
+Our RAMP pipeline~(companion paper) uses data-free NSDS sensitivity for consumer feasibility.
+
+\paragraph{Speculative decoding.}
+DFlash~(arXiv:2602.06036) introduces block diffusion drafting.
+EAGLE and Medusa propose learned drafters.
+We document that all these methods fail on hybrid GDN-attention architectures due to the State Barrier~(companion paper).
 
 \section{Conclusion}
 
 Chim\`ere demonstrates that a carefully integrated system can run a 35B MoE model at 93~tok/s on consumer hardware with self-improving quality. The system is fully open-source: runtime (\url{https://github.com/AIdevsmartdata/chimere}), orchestrator (\url{https://github.com/AIdevsmartdata/chimere-odo}), and quantization pipeline (\url{https://github.com/AIdevsmartdata/ramp-quant}).
 
-\begin{thebibliography}{10}
+\begin{thebibliography}{15}
 
 \bibitem{dflash2024}
 z-lab. DFlash: Accelerating autoregressive inference with block diffusion. \emph{arXiv:2602.06036}, 2024.
@@ -231,11 +256,17 @@ DeepSeek-AI. Engram: Memory-augmented language models via conditional memory. \e
 \bibitem{ktransformers2024}
 KTransformers. CPU/GPU co-serving for MoE inference. GitHub, 2024.
 
+\bibitem{powerinfer2024}
+Song, Y., et~al. PowerInfer: Fast large language model serving with a consumer-grade GPU. \emph{MLSys}, 2024.
+
 \bibitem{thinkprm2024}
 Luo, L., et~al. Improve mathematical reasoning in language models by automated process supervision. \emph{arXiv:2406.06592}, 2024.
 
 \bibitem{dspy2024}
 Khattab, O., et~al. DSPy: Compiling declarative language model calls into self-improving pipelines. \emph{ICLR}, 2024.
+
+\bibitem{spin2024}
+Chen, Z., et~al. Self-play fine-tuning converts weak language models to strong language models. \emph{ICML}, 2024.
 
 \bibitem{spinquant2024}
 Liu, Z., et~al. SpinQuant: LLM quantization with learned rotations. \emph{arXiv:2405.16406}, 2024.
