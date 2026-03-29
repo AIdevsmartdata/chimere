@@ -1,0 +1,60 @@
+From 5fcedf42c4eb4a3861196c002aff5f02b5b8871b Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?K=C3=A9vin=20Remondi=C3=A8re?= <remondiere@openclaw.local>
+Date: Tue, 24 Mar 2026 23:15:36 +0100
+Subject: [PATCH 4/5] fix: MTP decode working for Qwen3.5-35B-A3B MoE (bug
+ #7+#8)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Bug #7: compute buffer reserve for MTP graph — added graph_reserve
+with MTP_OP_WARMUP at init to pre-allocate for larger MTP graph.
+
+Bug #8: llama_set_inputs SEGV on GDN inputs — MTP graph has no
+recurrent/GDN layers, skip inp_s_mask/inp_s_seq/inp_s_seq_qnext
+when mtp_op_type != MTP_OP_NONE.
+
+Total: 8 bugs found and fixed for MTP on QWEN35MOE:
+1. TENSOR_SKIP unconditional
+2. cparams.mtp whitelist (GLM4_MOE only)
+3. Gated Q (wq = Q+Gate) in build_mtp_tail
+4. M-RoPE is_multi flag
+5. Compute buffer not reserved for MTP graph
+6. llama_set_inputs crash on GDN inputs
+7-8. Combined in this commit
+
+Result: MTP decode produces logits, server generates text with
+speculative MTP drafting. First MTP working on Qwen3.5-35B-A3B MoE.
+Acceptance rate = 0% (expected: MTP weights are F16, not quantized
+like main model IQ3_S — need quantization alignment).
+
+Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>
+---
+ src/llama.cpp | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 9c2f74b..2a7aa75 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -3038,7 +3038,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
+         }
+     }
+ 
+-    if (kv_self.recurrent) {
++    if (kv_self.recurrent && cparams.mtp_op_type == MTP_OP_NONE) {
+         const int64_t n_kv = kv_self.n;
+ 
+         if (lctx.inp_s_mask) {
+@@ -3085,7 +3085,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
+         }
+     }
+ 
+-    if (lctx.inp_s_seq_qnext) {
++    if (lctx.inp_s_seq_qnext && cparams.mtp_op_type == MTP_OP_NONE) {
+         const int64_t n_tokens = batch.n_tokens;
+ 
+         GGML_ASSERT(ggml_backend_buffer_is_host(lctx.inp_s_seq_qnext->buffer));
+-- 
+2.43.0
+

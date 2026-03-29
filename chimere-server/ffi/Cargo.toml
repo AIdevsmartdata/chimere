@@ -1,0 +1,19 @@
+[package]
+name = "ggml-ffi"
+version = "0.1.0"
+edition = "2021"
+description = "Quantized GEMV via ggml FFI (IQ3_S, Q8_0, Q5_K) + pure-Rust validation"
+
+[lib]
+name = "ggml_ffi"
+path = "src/lib.rs"
+
+[[bin]]
+name = "test_ggml"
+path = "src/main.rs"
+
+[features]
+ggml_iq3s = []
+
+[build-dependencies]
+cc = "1"

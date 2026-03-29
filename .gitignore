@@ -1,0 +1,41 @@
+# Build artifacts
+target/
+*.o
+*.cubin
+*.so
+*.dylib
+
+# Models (too large for git)
+*.gguf
+*.bin
+*.pt
+*.safetensors
+*.engr
+
+# Data
+data/
+checkpoints*/
+logs/
+*.log
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+.env.*
+credentials/

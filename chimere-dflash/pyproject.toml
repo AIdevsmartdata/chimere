@@ -1,0 +1,19 @@
+[project]
+name = "chimere-dflash"
+version = "0.1.0"
+description = "Block diffusion drafter for speculative decoding (Chimère project)"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.5",
+    "transformers>=4.45",
+    "datasets",
+    "wandb",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "bitsandbytes"]
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.backends._legacy:_Backend"

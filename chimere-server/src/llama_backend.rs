@@ -1,0 +1,1040 @@
+//! libllama FFI backend — uses ik_llama's optimized forward pass for 93 tok/s parity.
+//!
+//! Toggle: `CHIMERE_LLAMA_BACKEND=1`
+//!
+//! This backend delegates the ENTIRE forward pass (embedding, all layers, lm_head)
+//! to libllama.so from ik_llama.cpp. chimere's own weight loading (Candle, cudarc)
+//! is completely bypassed — libllama loads weights from GGUF once, using its own
+//! optimized CUDA kernels (MMVQ, flash attention, fused MoE).
+//!
+//! ## Why not just use llama-server directly?
+//!
+//! chimere adds value on top of libllama's forward pass:
+//! - Custom sampling (DRY penalty, Engram-aware temperature)
+//! - Entropy-adaptive routing (future: switch attention heads)
+//! - Block diffusion / multi-draft generation
+//! - SSE streaming with OpenAI-compatible API
+//!
+//! ## Architecture
+//!
+//! ```text
+//! chimere-server
+//!   ├── tokenizer (tokenizers crate)
+//!   ├── LlamaForward (this module)
+//!   │     ├── llama_model (loaded via libllama FFI)
+//!   │     ├── llama_context (KV cache, GDN state managed by libllama)
+//!   │     └── llama_decode() → raw logits
+//!   ├── sampling (chimere's own: temperature, top_p, DRY, etc.)
+//!   └── SSE streaming server (axum)
+//! ```
+//!
+//! ## Thread safety
+//!
+//! `LlamaForward` is `!Send` and `!Sync` (raw pointers). The server wraps it
+//! in `tokio::sync::Mutex` for serialized access — same pattern as the cudarc path.
+//!
+//! ## ncmoe
+//!
+//! The `-ncmoe N` mechanism is replicated via `tensor_buft_overrides`: for each
+//! layer 0..N, MoE expert weights are pinned to CPU buffer type. This matches
+//! ik_llama-server's `--n-cpu-moe` behavior exactly.
+
+use std::ffi::{c_char, c_float, c_int, c_void, CString};
+
+// ---------------------------------------------------------------------------
+// Opaque types — llama.h forward-declares these as opaque structs
+// ---------------------------------------------------------------------------
+
+#[repr(C)]
+pub struct LlamaModel {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct LlamaContext {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct LlamaVocab {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+pub struct GgmlBackendBufferType {
+    _private: [u8; 0],
+}
+
+// ---------------------------------------------------------------------------
+// Struct reproductions from llama.h (must match C layout EXACTLY)
+// ---------------------------------------------------------------------------
+
+/// Mirrors `struct llama_batch` from llama.h (line 314-332).
+///
+/// When using `llama_batch_get_one()`, only `n_tokens`, `token`, `all_pos_0`,
+/// `all_pos_1`, and `all_seq_id` are set. The pointer fields (pos, n_seq_id,
+/// seq_id, logits) are NULL.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct LlamaBatch {
+    pub n_tokens: i32,
+    pub token: *mut i32,
+    pub embd: *mut c_float,
+    pub pos: *mut i32,        // llama_pos = i32
+    pub n_seq_id: *mut i32,
+    pub seq_id: *mut *mut i32, // llama_seq_id** = i32**
+    pub logits: *mut i8,
+    // Helper fields for simple batches:
+    pub all_pos_0: i32,  // llama_pos
+    pub all_pos_1: i32,  // llama_pos
+    pub all_seq_id: i32, // llama_seq_id
+}
+
+/// Mirrors `struct llama_model_tensor_buft_override` from llama.h (line 354-357).
+#[repr(C)]
+pub struct LlamaModelTensorBuftOverride {
+    pub pattern: *const c_char,
+    pub buft: *mut GgmlBackendBufferType,
+}
+
+/// Progress callback type.
+type LlamaProgressCallback = Option<extern "C" fn(f32, *mut c_void) -> bool>;
+
+/// Mirrors `struct llama_model_params` from llama.h (line 359-403).
+/// Field order and types must match EXACTLY for ABI compatibility.
+#[repr(C)]
+pub struct LlamaModelParams {
+    pub devices: *const c_char,
+    pub n_gpu_layers: i32,
+    pub mla: i32,
+    pub split_mode: i32, // enum llama_split_mode
+    pub main_gpu: i32,
+    pub max_gpu: i32,
+    pub tensor_split: *const c_float,
+    pub rpc_servers: *const c_char,
+    pub progress_callback: LlamaProgressCallback,
+    pub progress_callback_user_data: *mut c_void,
+    pub kv_overrides: *const c_void, // llama_model_kv_override*
+    pub tensor_buft_overrides: *const LlamaModelTensorBuftOverride,
+    // Booleans (packed together per llama.h comment)
+    pub vocab_only: bool,
+    pub use_mmap: bool,
+    pub use_mlock: bool,
+    pub check_tensors: bool,
+    pub repack_tensors: bool,
+    pub use_thp: bool,
+    pub validate_quants: bool,
+    pub merge_qkv: bool,
+    pub merge_up_gate_exps: bool,
+    pub mtp: bool,
+}
+
+/// Eval callback type (ggml_backend_sched_eval_callback).
+type GgmlBackendSchedEvalCallback =
+    Option<extern "C" fn(*mut c_void, bool, *mut c_void) -> bool>;
+
+/// Abort callback type (ggml_abort_callback).
+type GgmlAbortCallback = Option<extern "C" fn(*mut c_void) -> bool>;
+
+/// Mirrors `struct llama_context_params` from llama.h (line 408-468).
+/// Field order and types must match EXACTLY.
+#[repr(C)]
+pub struct LlamaContextParams {
+    pub seed: u32,
+    pub n_ctx: u32,
+    pub n_batch: u32,
+    pub n_ubatch: u32,
+    pub n_seq_max: u32,
+    pub n_threads: u32,
+    pub n_threads_batch: u32,
+    pub max_extra_alloc: i32,
+    pub rope_scaling_type: i32, // enum llama_rope_scaling_type
+    pub pooling_type: i32,      // enum llama_pooling_type
+    pub attention_type: i32,    // enum llama_attention_type
+    pub rope_freq_base: c_float,
+    pub rope_freq_scale: c_float,
+    pub yarn_ext_factor: c_float,
+    pub yarn_attn_factor: c_float,
+    pub yarn_beta_fast: c_float,
+    pub yarn_beta_slow: c_float,
+    pub yarn_orig_ctx: u32,
+    pub defrag_thold: c_float,
+    pub cb_eval: GgmlBackendSchedEvalCallback,
+    pub cb_eval_user_data: *mut c_void,
+    pub type_k: i32, // enum ggml_type
+    pub type_v: i32, // enum ggml_type
+    pub type_reduce: i32, // enum ggml_type
+    // Booleans
+    pub logits_all: bool,
+    pub embeddings: bool,
+    pub offload_kqv: bool,
+    pub flash_attn: bool,
+    pub mla_attn: c_int,
+    pub attn_max_batch: c_int,
+    pub fused_moe_up_gate: bool,
+    pub grouped_expert_routing: bool,
+    pub fused_up_gate: bool,
+    pub fused_mmad: bool,
+    pub rope_cache: bool,
+    pub graph_reuse: bool,
+    pub min_experts: c_int,
+    pub thresh_experts: c_float,
+    pub only_active_experts: bool,
+    pub k_cache_hadamard: bool,
+    pub split_mode_graph_scheduling: bool,
+    pub scheduler_async: bool,
+    pub mtp: bool,
+    pub mtp_op_type: i32, // enum llama_mtp_op_type
+    pub abort_callback: GgmlAbortCallback,
+    pub abort_callback_data: *mut c_void,
+    pub offload_policy: *mut c_void,
+    pub cuda_params: *mut c_void,
+}
+
+/// Performance timing information from llama.h.
+#[repr(C)]
+#[derive(Debug, Clone)]
+pub struct LlamaTimings {
+    pub t_start_ms: f64,
+    pub t_end_ms: f64,
+    pub t_load_ms: f64,
+    pub t_sample_ms: f64,
+    pub t_p_eval_ms: f64,
+    pub t_eval_ms: f64,
+    pub n_sample: i32,
+    pub n_p_eval: i32,
+    pub n_eval: i32,
+}
+
+/// FFI struct for logprob results from C++ sampler
+#[repr(C)]
+pub struct ChimereLogprobResult {
+    pub token_id: i32,
+    pub n_top: i32,
+    pub top_tokens: [i32; 5],
+    pub top_logprobs: [f32; 5],
+}
+
+/// Top-k logprob entry (token ID + log probability)
+#[derive(Debug, Clone)]
+pub struct TokenLogprob {
+    pub token: u32,
+    pub logprob: f32,
+}
+
+// ggml_type constants we need for KV cache type specification
+#[allow(dead_code)]
+const GGML_TYPE_F16: i32 = 1;
+const GGML_TYPE_Q8_0: i32 = 8;
+const GGML_TYPE_Q4_0: i32 = 2;
+
+/// MTP operation types — mirrors `enum llama_mtp_op_type` from llama.h
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum MtpOp {
+    None = 0,
+    Warmup = 1,
+    UpdateAccepted = 2,
+    DraftGen = 3,
+}
+
+// ---------------------------------------------------------------------------
+// FFI function declarations
+// ---------------------------------------------------------------------------
+
+extern "C" {
+    fn llama_backend_init();
+    fn llama_backend_free();
+
+    fn llama_model_default_params() -> LlamaModelParams;
+    fn llama_context_default_params() -> LlamaContextParams;
+
+    fn llama_model_load_from_file(
+        path: *const c_char,
+        params: LlamaModelParams,
+    ) -> *mut LlamaModel;
+    fn llama_free_model(model: *mut LlamaModel);
+
+    fn llama_init_from_model(
+        model: *mut LlamaModel,
+        params: LlamaContextParams,
+    ) -> *mut LlamaContext;
+    fn llama_free(ctx: *mut LlamaContext);
+
+    fn llama_decode(ctx: *mut LlamaContext, batch: LlamaBatch) -> i32;
+
+    fn llama_get_logits_ith(ctx: *mut LlamaContext, i: i32) -> *mut c_float;
+
+    fn llama_batch_get_one(
+        tokens: *mut i32,  // llama_token*
+        n_tokens: i32,
+        pos_0: i32,        // llama_pos
+        seq_id: i32,       // llama_seq_id
+    ) -> LlamaBatch;
+
+    fn llama_batch_init(n_tokens: i32, embd: i32, n_seq_max: i32) -> LlamaBatch;
+    fn llama_batch_free(batch: LlamaBatch);
+
+    fn llama_kv_cache_clear(ctx: *mut LlamaContext);
+
+    fn llama_model_get_vocab(model: *const LlamaModel) -> *const LlamaVocab;
+    fn llama_vocab_n_tokens(vocab: *const LlamaVocab) -> i32;
+    fn llama_n_vocab(model: *const LlamaModel) -> i32;
+
+    fn llama_get_timings(ctx: *mut LlamaContext) -> LlamaTimings;
+    fn llama_print_timings(ctx: *mut LlamaContext);
+    fn llama_reset_timings(ctx: *mut LlamaContext);
+
+    fn llama_model_is_hybrid(model: *const LlamaModel) -> bool;
+    fn llama_model_is_recurrent(model: *const LlamaModel) -> bool;
+    fn llama_model_has_recurrent(model: *const LlamaModel) -> bool;
+
+    // ggml function for CPU buffer type (needed for ncmoe overrides)
+    fn ggml_backend_cpu_buffer_type() -> *mut GgmlBackendBufferType;
+
+    // State serialization (for multi-agent context switching)
+    fn llama_state_seq_get_size(ctx: *mut LlamaContext, seq_id: i32, flags: u32) -> usize;
+    fn llama_state_seq_get_data(ctx: *mut LlamaContext, dst: *mut u8, size: usize, seq_id: i32, flags: u32) -> usize;
+    fn llama_state_seq_set_data(ctx: *mut LlamaContext, src: *const u8, size: usize, seq_id: i32, flags: u32) -> usize;
+
+    // MTP (Multi-Token Prediction)
+    fn llama_model_n_nextn_layer(model: *const LlamaModel) -> i32;
+    fn llama_set_mtp_op_type(ctx: *mut LlamaContext, mtp_op_type: i32);
+    fn llama_set_draft_input_hidden_state(ctx: *mut LlamaContext, hidden_state: *const c_float);
+    fn llama_get_embeddings(ctx: *mut LlamaContext) -> *mut c_float;
+    fn llama_model_n_embd(model: *const LlamaModel) -> i32;
+
+    // KV cache manipulation (for draft rejection)
+    fn llama_kv_cache_seq_rm(ctx: *mut LlamaContext, seq_id: i32, p0: i32, p1: i32) -> bool;
+
+    // chimere_sampler — C++ wrapper for fast sampling (avoids 993KB logits copy)
+    fn chimere_sampler_init(
+        model: *const LlamaModel,
+        temperature: f32, top_p: f32, top_k: c_int,
+        min_p: f32, presence_penalty: f32,
+        dry_multiplier: f32, dry_base: f32,
+        dry_min_length: c_int, dry_penalty_last_n: c_int,
+    ) -> *mut c_void;
+    fn chimere_sampler_sample(smpl: *mut c_void, ctx: *mut LlamaContext, idx: c_int) -> i32;
+    fn chimere_sampler_sample_with_logprobs(
+        smpl: *mut c_void, ctx: *mut LlamaContext, idx: c_int,
+        result: *mut ChimereLogprobResult);
+    fn chimere_sampler_accept(smpl: *mut c_void, ctx: *mut LlamaContext, token: i32);
+    fn chimere_sampler_set_logit_bias(smpl: *mut c_void, token_id: i32, bias: f32);
+    fn chimere_sampler_clear_logit_bias(smpl: *mut c_void);
+    fn chimere_sampler_set_engram_bias(
+        smpl: *mut c_void, token_ids: *const i32, biases: *const f32, n_entries: c_int);
+    fn chimere_sampler_clear_engram_bias(smpl: *mut c_void);
+    fn chimere_sampler_reset(smpl: *mut c_void);
+    fn chimere_sampler_free(smpl: *mut c_void);
+}
+
+// ---------------------------------------------------------------------------
+// Safe wrapper
+// ---------------------------------------------------------------------------
+
+/// Safe wrapper around libllama's model + context for full forward pass delegation.
+///
+/// Owns the llama_model and llama_context pointers, freeing them on drop.
+/// All state (KV cache, GDN recurrent state) is managed internally by libllama.
+pub struct LlamaForward {
+    model: *mut LlamaModel,
+    ctx: *mut LlamaContext,
+    n_vocab: usize,
+    n_embd: usize,
+    pos: i32,
+    mtp_available: bool,
+    /// C++ sampler for fast token sampling (avoids 993KB logits copy)
+    sampler: *mut c_void,
+    /// Stored ncmoe CString patterns — must outlive the model load.
+    _ncmoe_patterns: Vec<CString>,
+    /// Stored override structs — must outlive the model load.
+    _ncmoe_overrides: Vec<LlamaModelTensorBuftOverride>,
+}
+
+// Raw pointers are not Send/Sync by default, which is correct —
+// we rely on the server's Mutex for thread safety.
+// Explicitly mark as Send so it can be held inside tokio::sync::Mutex.
+// Safety: single-threaded access enforced by the Mutex in server.rs.
+unsafe impl Send for LlamaForward {}
+
+impl LlamaForward {
+    /// Load a model from GGUF and create a context for inference.
+    ///
+    /// # Arguments
+    /// * `model_path` - Path to the GGUF file
+    /// * `n_gpu_layers` - Number of layers to offload to GPU (99 = all)
+    /// * `n_ctx` - Context size (e.g. 65536 for 64K)
+    /// * `ncmoe` - Number of layers whose MoE experts stay on CPU (0 = all on GPU)
+    /// * `type_k` - KV cache key type (ggml_type, e.g. GGML_TYPE_Q8_0 = 8)
+    /// * `type_v` - KV cache value type (ggml_type, e.g. GGML_TYPE_Q4_0 = 2)
+    /// * `flash_attn` - Enable flash attention
+    pub fn new(
+        model_path: &str,
+        n_gpu_layers: i32,
+        n_ctx: u32,
+        ncmoe: u32,
+        type_k: Option<i32>,
+        type_v: Option<i32>,
+        flash_attn: bool,
+    ) -> Result<Self, String> {
+        // Initialize the llama backend (idempotent, safe to call multiple times)
+        unsafe {
+            llama_backend_init();
+        }
+
+        let c_path = CString::new(model_path).map_err(|e| e.to_string())?;
+
+        // --- Build ncmoe tensor_buft_overrides ---
+        // For each layer 0..ncmoe, create a pattern that pins MoE expert
+        // weights to CPU buffer, exactly like ik_llama's --n-cpu-moe.
+        let cpu_buft = unsafe { ggml_backend_cpu_buffer_type() };
+        let mut ncmoe_patterns: Vec<CString> = Vec::new();
+        let mut ncmoe_overrides: Vec<LlamaModelTensorBuftOverride> = Vec::new();
+
+        for layer in 0..ncmoe {
+            let pattern_str = format!(
+                "blk\\.{}\\.ffn_(up|down|gate)_exps\\.weight",
+                layer
+            );
+            let c_pattern = CString::new(pattern_str).map_err(|e| e.to_string())?;
+            ncmoe_patterns.push(c_pattern);
+        }
+
+        // Build override array — patterns must point into ncmoe_patterns
+        for pattern in &ncmoe_patterns {
+            ncmoe_overrides.push(LlamaModelTensorBuftOverride {
+                pattern: pattern.as_ptr(),
+                buft: cpu_buft,
+            });
+        }
+        // Sentinel: NULL-terminated array
+        ncmoe_overrides.push(LlamaModelTensorBuftOverride {
+            pattern: std::ptr::null(),
+            buft: std::ptr::null_mut(),
+        });
+
+        // --- Model params ---
+        let mut mparams = unsafe { llama_model_default_params() };
+        mparams.n_gpu_layers = n_gpu_layers;
+        mparams.tensor_buft_overrides = ncmoe_overrides.as_ptr();
+        // Enable MTP if the GGUF has MTP layers
+        mparams.mtp = true;
+
+        eprintln!(
+            "[LLAMA_BACKEND] Loading model from {} (ngl={}, ncmoe={}, ctx={})...",
+            model_path, n_gpu_layers, ncmoe, n_ctx,
+        );
+
+        let model = unsafe { llama_model_load_from_file(c_path.as_ptr(), mparams) };
+        if model.is_null() {
+            return Err(format!("llama_model_load_from_file failed for {}", model_path));
+        }
+
+        // Report model type
+        let is_hybrid = unsafe { llama_model_is_hybrid(model) };
+        let is_recurrent = unsafe { llama_model_is_recurrent(model) };
+        let has_recurrent = unsafe { llama_model_has_recurrent(model) };
+        eprintln!(
+            "[LLAMA_BACKEND] Model loaded: hybrid={}, recurrent={}, has_recurrent={}",
+            is_hybrid, is_recurrent, has_recurrent,
+        );
+
+        // --- Context params ---
+        let mut cparams = unsafe { llama_context_default_params() };
+        cparams.n_ctx = n_ctx;
+        cparams.n_batch = 4096; // Match ik_llama production: -b 4096
+        cparams.n_ubatch = 512; // Match ik_llama production: -ub 512
+        cparams.flash_attn = flash_attn;
+        cparams.offload_kqv = true;
+        // KV cache types: default to production settings (q8_0 keys, q4_0 values)
+        cparams.type_k = type_k.unwrap_or(GGML_TYPE_Q8_0);
+        cparams.type_v = type_v.unwrap_or(GGML_TYPE_Q4_0);
+        // Hadamard rotation on K cache (improves quantized KV quality)
+        let k_cache_hadamard = std::env::var("CHIMERE_KV_HADAMARD")
+            .map(|v| v != "0")
+            .unwrap_or(true);
+        cparams.k_cache_hadamard = k_cache_hadamard;
+        // Enable MTP in context params (needed for embeddings + logits buffer allocation)
+        cparams.mtp = true;
+
+        let ctx = unsafe { llama_init_from_model(model, cparams) };
+        if ctx.is_null() {
+            unsafe {
+                llama_free_model(model);
+            }
+            return Err("llama_init_from_model failed".into());
+        }
+
+        // Get vocab size and embedding dimension
+        let n_vocab = unsafe { llama_n_vocab(model) } as usize;
+        let n_embd = unsafe { llama_model_n_embd(model) } as usize;
+        let n_mtp_layers = unsafe { llama_model_n_nextn_layer(model) };
+        let mtp_available = n_mtp_layers > 0;
+
+        if mtp_available {
+            // Enable MTP in context params — needed for has_mtp checks + embedding extraction
+            unsafe { llama_set_mtp_op_type(ctx, MtpOp::None as i32); }
+            eprintln!("[LLAMA_BACKEND] MTP available: {} nextn layers, n_embd={}", n_mtp_layers, n_embd);
+        }
+
+        eprintln!(
+            "[LLAMA_BACKEND] Context created: n_ctx={}, n_batch=4096, n_ubatch=512, \
+             flash_attn={}, type_k={}, type_v={}, k_cache_hadamard={}, n_vocab={}, mtp={}",
+            n_ctx, flash_attn,
+            type_k.unwrap_or(GGML_TYPE_Q8_0),
+            type_v.unwrap_or(GGML_TYPE_Q4_0),
+            k_cache_hadamard,
+            n_vocab, mtp_available,
+        );
+
+        // Reset timings for clean measurement
+        unsafe {
+            llama_reset_timings(ctx);
+        }
+
+        // Create C++ sampler with Qwen3.5 optimal params (thinking mode)
+        // Ref: Unsloth docs + Qwen3.5 official sampling recommendations
+        let sampler = unsafe {
+            chimere_sampler_init(
+                model as *const LlamaModel,
+                0.6,   // temperature — Qwen3.5 thinking mode (0.7 for chat)
+                0.95,  // top_p
+                20,    // top_k
+                0.05,  // min_p — better than top_k alone (2026 consensus)
+                0.0,   // presence_penalty (0 for thinking, 1.5 if loops)
+                0.8,   // dry_multiplier — prevents thinking loops
+                1.75,  // dry_base
+                2,     // dry_min_length
+                -1,    // dry_penalty_last_n (-1 = whole sequence)
+            )
+        };
+        if sampler.is_null() {
+            eprintln!("[LLAMA_BACKEND] Warning: C++ sampler init failed, falling back to Rust sampling");
+        } else {
+            eprintln!("[LLAMA_BACKEND] C++ sampler initialized (avoids 993KB logits copy per token)");
+        }
+
+        Ok(Self {
+            model,
+            ctx,
+            n_vocab,
+            n_embd,
+            pos: 0,
+            mtp_available,
+            sampler,
+            _ncmoe_patterns: ncmoe_patterns,
+            _ncmoe_overrides: ncmoe_overrides,
+        })
+    }
+
+    /// Forward pass for a single token. Returns raw logits (pre-softmax).
+    ///
+    /// The position is auto-incremented. libllama manages KV cache and
+    /// recurrent state internally.
+    ///
+    /// # Returns
+    /// Vec<f32> of length n_vocab containing unnormalized log-probabilities.
+    pub fn forward_token(&mut self, token: u32) -> Result<Vec<f32>, String> {
+        let mut tok = token as i32;
+        let batch = unsafe { llama_batch_get_one(&mut tok, 1, self.pos, 0) };
+
+        let ret = unsafe { llama_decode(self.ctx, batch) };
+        if ret != 0 {
+            return Err(format!(
+                "llama_decode failed with code {} at pos={}",
+                ret, self.pos
+            ));
+        }
+
+        // llama_batch_get_one sets logits for the last token only.
+        // With n_tokens=1, the logits are at index 0 in the output buffer.
+        // Use index -1 (last token) which is the recommended approach.
+        let logits_ptr = unsafe { llama_get_logits_ith(self.ctx, -1) };
+        if logits_ptr.is_null() {
+            return Err("llama_get_logits_ith returned null".into());
+        }
+
+        let logits = unsafe { std::slice::from_raw_parts(logits_ptr, self.n_vocab) };
+        self.pos += 1;
+
+        Ok(logits.to_vec())
+    }
+
+    /// Forward pass for a single token WITHOUT copying logits.
+    /// Use with sample_token_fast() for zero-copy sampling.
+    pub fn forward_token_no_logits(&mut self, token: u32) -> Result<(), String> {
+        let mut tok = token as i32;
+        let batch = unsafe { llama_batch_get_one(&mut tok, 1, self.pos, 0) };
+
+        let ret = unsafe { llama_decode(self.ctx, batch) };
+        if ret != 0 {
+            return Err(format!("llama_decode failed with code {} at pos={}", ret, self.pos));
+        }
+        self.pos += 1;
+        Ok(())
+    }
+
+    /// Prefill without copying logits (for use with sample_token_fast).
+    pub fn forward_prefill_no_logits(&mut self, tokens: &[u32]) -> Result<(), String> {
+        if tokens.is_empty() {
+            return Err("forward_prefill_no_logits: empty token slice".into());
+        }
+        let mut toks: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let batch = unsafe { llama_batch_get_one(toks.as_mut_ptr(), toks.len() as i32, self.pos, 0) };
+        let ret = unsafe { llama_decode(self.ctx, batch) };
+        if ret != 0 {
+            return Err(format!("llama_decode failed with code {} at pos={}", ret, self.pos));
+        }
+        self.pos += toks.len() as i32;
+        Ok(())
+    }
+
+    /// Batch-verify draft tokens for speculative decoding (DART).
+    ///
+    /// Decodes N draft tokens in a single llama_decode call and returns
+    /// the logits at each position. The caller can then check if each
+    /// draft token matches the argmax of the logits at that position.
+    ///
+    /// Uses llama_batch_init with per-position logits enabled.
+    /// Returns Vec of (position, logits_vec) for each draft token.
+    ///
+    /// On success, self.pos is advanced by the number of ACCEPTED tokens + 1.
+    pub fn forward_batch_verify(&mut self, draft_tokens: &[u32]) -> Result<Vec<Vec<f32>>, String> {
+        if draft_tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let n = draft_tokens.len() as i32;
+        let mut batch = unsafe { llama_batch_init(n, 0, 1) };
+
+        // Fill batch: each draft token at its position, all requesting logits
+        unsafe {
+            batch.n_tokens = n;
+            for (i, &tok) in draft_tokens.iter().enumerate() {
+                *batch.token.add(i) = tok as i32;
+                *batch.pos.add(i) = self.pos + i as i32;
+                *batch.n_seq_id.add(i) = 1;
+                let seq_ptr = *batch.seq_id.add(i);
+                *seq_ptr = 0; // seq_id = 0
+                *batch.logits.add(i) = 1; // request logits for ALL positions
+            }
+        }
+
+        let ret = unsafe { llama_decode(self.ctx, batch) };
+        if ret != 0 {
+            unsafe { llama_batch_free(batch); }
+            return Err(format!("llama_decode batch verify failed: code {}", ret));
+        }
+
+        // Extract logits at each position
+        let mut all_logits = Vec::with_capacity(draft_tokens.len());
+        for i in 0..draft_tokens.len() {
+            let logits_ptr = unsafe { llama_get_logits_ith(self.ctx, i as i32) };
+            if logits_ptr.is_null() {
+                unsafe { llama_batch_free(batch); }
+                return Err(format!("null logits at position {}", i));
+            }
+            let logits = unsafe { std::slice::from_raw_parts(logits_ptr, self.n_vocab) };
+            all_logits.push(logits.to_vec());
+        }
+
+        unsafe { llama_batch_free(batch); }
+
+        // Don't advance pos here — caller decides how many tokens to accept
+        Ok(all_logits)
+    }
+
+    /// Accept N tokens after successful batch verification.
+    /// Advances pos by count.
+    pub fn accept_draft_tokens(&mut self, count: usize) {
+        self.pos += count as i32;
+    }
+
+    /// Accept a token into the sampler's history (for DRY/repetition tracking).
+    pub fn sampler_accept(&self, token: u32) {
+        if !self.sampler.is_null() {
+            unsafe { chimere_sampler_accept(self.sampler, self.ctx, token as i32); }
+        }
+    }
+
+    /// Prefill a sequence of tokens. Returns logits for the LAST token only.
+    ///
+    /// Uses llama_batch_get_one which auto-sets positions starting at self.pos.
+    /// For large prompts (> n_batch), this should be split into chunks —
+    /// but for typical use (< 4096 tokens), a single call suffices.
+    ///
+    /// # Returns
+    /// Vec<f32> of length n_vocab (logits for the last prompt token).
+    pub fn forward_prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        if tokens.is_empty() {
+            return Err("forward_prefill: empty token slice".into());
+        }
+
+        let n = tokens.len();
+        let mut toks: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+
+        // Process in chunks of n_batch (4096) to respect the batch size limit.
+        let n_batch = 4096usize;
+        let mut last_logits: Option<Vec<f32>> = None;
+
+        let mut offset = 0;
+        while offset < n {
+            let chunk_size = (n - offset).min(n_batch);
+            let chunk = &mut toks[offset..offset + chunk_size];
+
+            let batch = unsafe {
+                llama_batch_get_one(
+                    chunk.as_mut_ptr(),
+                    chunk_size as i32,
+                    self.pos,
+                    0,
+                )
+            };
+
+            let ret = unsafe { llama_decode(self.ctx, batch) };
+            if ret != 0 {
+                return Err(format!(
+                    "llama_decode failed with code {} during prefill (pos={}, chunk={})",
+                    ret, self.pos, chunk_size,
+                ));
+            }
+
+            self.pos += chunk_size as i32;
+            offset += chunk_size;
+
+            // Extract logits from the last chunk
+            if offset == n {
+                let logits_ptr = unsafe { llama_get_logits_ith(self.ctx, -1) };
+                if logits_ptr.is_null() {
+                    return Err("llama_get_logits_ith returned null during prefill".into());
+                }
+                let logits =
+                    unsafe { std::slice::from_raw_parts(logits_ptr, self.n_vocab) };
+                last_logits = Some(logits.to_vec());
+            }
+        }
+
+        last_logits.ok_or_else(|| "forward_prefill: no logits produced".into())
+    }
+
+    /// Reset all state (KV cache + recurrent state + sampler) for a new conversation.
+    /// Save sequence state (KV + GDN recurrent) for multi-agent context switching.
+    pub fn state_seq_save(&self, seq_id: i32) -> Result<Vec<u8>, String> {
+        let size = unsafe { llama_state_seq_get_size(self.ctx, seq_id, 0) };
+        if size == 0 { return Ok(vec![]); }
+        let mut buf = vec![0u8; size];
+        let written = unsafe { llama_state_seq_get_data(self.ctx, buf.as_mut_ptr(), size, seq_id, 0) };
+        if written == 0 { return Err("state_seq_get_data failed".into()); }
+        buf.truncate(written);
+        Ok(buf)
+    }
+
+    /// Restore a previously saved sequence state.
+    pub fn state_seq_restore(&mut self, seq_id: i32, data: &[u8]) -> Result<(), String> {
+        if data.is_empty() { return Ok(()); }
+        let loaded = unsafe { llama_state_seq_set_data(self.ctx, data.as_ptr(), data.len(), seq_id, 0) };
+        if loaded == 0 { return Err("state_seq_set_data failed".into()); }
+        Ok(())
+    }
+
+    /// Set position counter (for agent context restore).
+    pub fn set_pos(&mut self, pos: i32) { self.pos = pos; }
+
+    pub fn reset(&mut self) {
+        unsafe {
+            llama_kv_cache_clear(self.ctx);
+            if !self.sampler.is_null() {
+                chimere_sampler_reset(self.sampler);
+            }
+        }
+        self.pos = 0;
+    }
+
+    /// Get the vocab size (for logits array sizing).
+    pub fn n_vocab(&self) -> usize {
+        self.n_vocab
+    }
+
+    /// Fast token sampling via C++ (no 993KB logits copy).
+    /// Returns sampled token ID. Uses the C++ common_sampler.
+    pub fn sample_token_fast(&mut self) -> Result<u32, String> {
+        if self.sampler.is_null() {
+            return Err("C++ sampler not initialized".into());
+        }
+        let token = unsafe {
+            chimere_sampler_sample(self.sampler, self.ctx, -1)
+        };
+        unsafe {
+            chimere_sampler_accept(self.sampler, self.ctx, token);
+        }
+        Ok(token as u32)
+    }
+
+    /// Fast sampling with top-5 logprobs (for ABF entropy/confidence).
+    pub fn sample_token_fast_with_logprobs(&mut self) -> Result<(u32, Vec<TokenLogprob>), String> {
+        if self.sampler.is_null() {
+            return Err("C++ sampler not initialized".into());
+        }
+        let mut result = ChimereLogprobResult {
+            token_id: 0, n_top: 0,
+            top_tokens: [0; 5], top_logprobs: [0.0; 5],
+        };
+        unsafe {
+            chimere_sampler_sample_with_logprobs(self.sampler, self.ctx, -1, &mut result);
+            chimere_sampler_accept(self.sampler, self.ctx, result.token_id);
+        }
+        let mut logprobs = Vec::with_capacity(result.n_top as usize);
+        for i in 0..result.n_top as usize {
+            logprobs.push(TokenLogprob {
+                token: result.top_tokens[i] as u32,
+                logprob: result.top_logprobs[i],
+            });
+        }
+        Ok((result.token_id as u32, logprobs))
+    }
+
+    /// Suppress a token (e.g., </think> in response mode).
+    pub fn set_logit_bias(&self, token_id: u32, bias: f32) {
+        if !self.sampler.is_null() {
+            unsafe { chimere_sampler_set_logit_bias(self.sampler, token_id as i32, bias); }
+        }
+    }
+
+    /// Clear all logit biases.
+    pub fn clear_logit_bias(&self) {
+        if !self.sampler.is_null() {
+            unsafe { chimere_sampler_clear_logit_bias(self.sampler); }
+        }
+    }
+
+    /// Set Engram logit biases from n-gram predictions.
+    /// Merges with existing biases (preserves </think> suppression).
+    pub fn set_engram_bias(&self, predictions: &[(u32, f32)]) {
+        if self.sampler.is_null() || predictions.is_empty() { return; }
+        let token_ids: Vec<i32> = predictions.iter().map(|(t, _)| *t as i32).collect();
+        let biases: Vec<f32> = predictions.iter().map(|(_, b)| *b).collect();
+        unsafe {
+            chimere_sampler_set_engram_bias(
+                self.sampler,
+                token_ids.as_ptr(),
+                biases.as_ptr(),
+                predictions.len() as c_int,
+            );
+        }
+    }
+
+    /// Clear only Engram biases (keep manual biases like </think>).
+    pub fn clear_engram_bias(&self) {
+        if !self.sampler.is_null() {
+            unsafe { chimere_sampler_clear_engram_bias(self.sampler); }
+        }
+    }
+
+    /// Check if sampler is available (for fallback logic).
+    pub fn has_fast_sampler(&self) -> bool {
+        !self.sampler.is_null()
+    }
+
+    /// Get the current position counter.
+    pub fn pos(&self) -> i32 {
+        self.pos
+    }
+
+    /// Print performance timings to stderr (llama.cpp format).
+    pub fn print_timings(&self) {
+        unsafe {
+            llama_print_timings(self.ctx);
+        }
+    }
+
+    /// Get performance timings.
+    pub fn get_timings(&self) -> LlamaTimings {
+        unsafe { llama_get_timings(self.ctx) }
+    }
+
+    /// Reset timings for a fresh measurement period.
+    pub fn reset_timings(&self) {
+        unsafe {
+            llama_reset_timings(self.ctx);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // MTP (Multi-Token Prediction) methods
+    // -----------------------------------------------------------------
+
+    /// Whether the loaded model has MTP layers.
+    pub fn has_mtp(&self) -> bool {
+        self.mtp_available
+    }
+
+    /// Get embedding dimension.
+    pub fn n_embd(&self) -> usize {
+        self.n_embd
+    }
+
+    /// Set MTP operation mode for the next decode call.
+    pub fn set_mtp_op(&mut self, op: MtpOp) {
+        unsafe { llama_set_mtp_op_type(self.ctx, op as i32); }
+    }
+
+    /// Get hidden state embeddings from the last decode (n_embd floats).
+    /// Returns None if embeddings are not available.
+    pub fn get_embeddings(&self) -> Option<Vec<f32>> {
+        let ptr = unsafe { llama_get_embeddings(self.ctx) };
+        if ptr.is_null() {
+            return None;
+        }
+        let embd = unsafe { std::slice::from_raw_parts(ptr, self.n_embd) };
+        Some(embd.to_vec())
+    }
+
+    /// Get raw embedding pointer (zero-copy, for passing to set_draft_hidden_state).
+    pub fn get_embeddings_ptr(&self) -> *const c_float {
+        unsafe { llama_get_embeddings(self.ctx) }
+    }
+
+    /// Set hidden state for MTP DRAFT_GEN operation.
+    pub fn set_draft_hidden_state(&mut self, hidden_state: *const c_float) {
+        unsafe { llama_set_draft_input_hidden_state(self.ctx, hidden_state); }
+    }
+
+    /// Forward pass with MTP: main decode → get embeddings → MTP draft decode → MTP logits.
+    ///
+    /// Returns (main_logits, mtp_logits_option).
+    /// MTP logits are only returned if the model has MTP and the main decode produced embeddings.
+    pub fn forward_token_with_mtp(&mut self, token: u32) -> Result<(Vec<f32>, Option<Vec<f32>>), String> {
+        // 1. Main decode (MTP_OP_NONE)
+        self.set_mtp_op(MtpOp::None);
+        let main_logits = self.forward_token(token)?;
+
+        if !self.mtp_available {
+            return Ok((main_logits, None));
+        }
+
+        // 2. Get embeddings from the main decode
+        let embd_ptr = self.get_embeddings_ptr();
+        if embd_ptr.is_null() {
+            return Ok((main_logits, None));
+        }
+
+        // 3. MTP decode — uses WARMUP which reads from lctx.embd automatically.
+        //    WARMUP also initializes/updates MTP's own KV cache.
+        //    (DRAFT_GEN requires separate hidden state + pre-initialized KV — more complex)
+        self.set_mtp_op(MtpOp::Warmup);
+
+        // MTP decode at same position as main decode (pos was already incremented)
+        let mut tok = token as i32;
+        let batch = unsafe { llama_batch_get_one(&mut tok, 1, self.pos - 1, 0) };
+        let ret = unsafe { llama_decode(self.ctx, batch) };
+        if ret != 0 {
+            // MTP decode failed — return main logits only
+            eprintln!("[MTP] Draft gen decode failed: code {}", ret);
+            self.set_mtp_op(MtpOp::None);
+            return Ok((main_logits, None));
+        }
+
+        // 4. Extract MTP logits
+        let mtp_ptr = unsafe { llama_get_logits_ith(self.ctx, -1) };
+        let mtp_logits = if mtp_ptr.is_null() {
+            None
+        } else {
+            let mtp = unsafe { std::slice::from_raw_parts(mtp_ptr, self.n_vocab) };
+            Some(mtp.to_vec())
+        };
+
+        // Reset to normal mode
+        self.set_mtp_op(MtpOp::None);
+
+        Ok((main_logits, mtp_logits))
+    }
+
+    /// Remove KV cache entries for a position range [p0, p1).
+    /// Used to undo rejected draft tokens from the attention KV cache.
+    pub fn kv_cache_seq_rm(&mut self, p0: i32, p1: i32) -> bool {
+        unsafe { llama_kv_cache_seq_rm(self.ctx, 0, p0, p1) }
+    }
+
+    /// Rollback position counter by n tokens.
+    pub fn rollback_pos(&mut self, n: i32) {
+        self.pos -= n;
+    }
+}
+
+impl Drop for LlamaForward {
+    fn drop(&mut self) {
+        eprintln!("[LLAMA_BACKEND] Shutting down...");
+        // Print final timings before cleanup
+        self.print_timings();
+        unsafe {
+            llama_free(self.ctx);
+            llama_free_model(self.model);
+            llama_backend_free();
+        }
+        eprintln!("[LLAMA_BACKEND] Cleanup complete.");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Environment-driven constructor (reads CHIMERE_* env vars)
+// ---------------------------------------------------------------------------
+
+/// Check if the llama backend is enabled.
+pub fn is_enabled() -> bool {
+    std::env::var("CHIMERE_LLAMA_BACKEND").is_ok()
+}
+
+/// Create a LlamaForward from environment variables.
+///
+/// Reads:
+/// - `CHIMERE_MODEL` — GGUF path (default: Qwen3.5 IQ3_S custom-mix)
+/// - `CHIMERE_NCMOE` — number of ncmoe layers (default: 4)
+/// - `CHIMERE_KV_MAX_SEQ` — context size (default: 65536)
+/// - `CHIMERE_KV_TYPE_K` — KV cache key type (default: 8 = Q8_0)
+/// - `CHIMERE_KV_TYPE_V` — KV cache value type (default: 2 = Q4_0)
+/// - `CHIMERE_FLASH_ATTN` — enable flash attention (default: 1)
+pub fn from_env() -> Result<LlamaForward, String> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "{HOME}".into());
+
+    let model_path = std::env::var("CHIMERE_MODEL").unwrap_or_else(|_| {
+        format!(
+            "{}/.chimere/models/Qwen3.5-35B-A3B-GGUF/Qwen3.5-35B-A3B-IQ3_S-custom-mix.gguf",
+            home,
+        )
+    });
+
+    let ncmoe: u32 = std::env::var("CHIMERE_NCMOE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
+
+    let n_ctx: u32 = std::env::var("CHIMERE_KV_MAX_SEQ")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(65536);
+
+    let type_k: i32 = std::env::var("CHIMERE_KV_TYPE_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(GGML_TYPE_Q8_0);
+
+    let type_v: i32 = std::env::var("CHIMERE_KV_TYPE_V")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(GGML_TYPE_Q4_0);
+
+    let flash_attn = std::env::var("CHIMERE_FLASH_ATTN")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+
+    LlamaForward::new(
+        &model_path,
+        99, // -ngl 99 = offload all layers
+        n_ctx,
+        ncmoe,
+        Some(type_k),
+        Some(type_v),
+        flash_attn,
+    )
+}
