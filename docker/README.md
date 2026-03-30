@@ -16,12 +16,13 @@ all from `docker compose up`.
  | :3000   |     |  :8084   |     |    :8081    |
  +---------+     +----------+     +-------------+
                       |                  ^
-                      v                  |
-                 +----------+     +-------------+
-                 | SearXNG  |     |   Nightly   |
-                 | (search) |     | (self-impr) |
-                 |  :8080   |     |  cron-based |
-                 +----------+     +-------------+
+                +-----+-----+           |
+                |           |     +-------------+
+           +----------+ +----------+  |   Nightly   |
+           | SearXNG  | | ChromaDB |  | (self-impr) |
+           | (search) | |  (RAG)   |  |  cron-based |
+           |  :8888   | |  :8000   |  +-------------+
+           +----------+ +----------+
 ```
 
 ## Quick Start
@@ -106,6 +107,12 @@ docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi
 Set these in `docker/.env` or pass them directly. The `detect-gpu.py` script
 generates sensible defaults for your hardware.
 
+**Shared (used by multiple containers):**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CHIMERE_HOME` | `/data` | Base data directory inside containers (Engram, logs, SOUL.md). Used by ODO and nightly. |
+
 **Inference:**
 
 | Variable | Default | Description |
@@ -119,6 +126,16 @@ generates sensible defaults for your hardware.
 | `CHIMERE_KV_V` | `q4_0` | Value cache quantization |
 | `CHIMERE_NP` | `1` | Number of parallel slots |
 | `GPU_ARCH` | `120` | CUDA architecture (89, 120, etc.) |
+
+**ODO (router):**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ODO_BACKEND` | `http://inference:8081` | URL of the llama-server backend |
+| `ODO_PORT` | `8084` | Port ODO listens on |
+| `SOUL_DIR` | `/data/soul` | Directory containing SOUL.md personality file |
+| `SEARXNG_URL` | `http://searxng:8080` | SearXNG endpoint for web search grounding |
+| `CHROMADB_URL` | `http://chromadb:8000` | ChromaDB endpoint for RAG vector retrieval |
 
 **Nightly self-improvement:**
 

@@ -222,7 +222,7 @@ def main() -> None:
 
     # Detect GPU
     gpu_name, vram_mb = run_nvidia_smi()
-    vram_gb = vram_mb // 1024
+    vram_gb = round(vram_mb / 1024)
     print(f"  GPU:           {gpu_name}")
     print(f"  VRAM:          {vram_mb} MB ({vram_gb} GB)")
 

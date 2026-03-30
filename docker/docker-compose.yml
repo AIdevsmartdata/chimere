@@ -79,6 +79,12 @@ services:
       CHIMERE_HOME: /data
       SEARXNG_URL: http://searxng:8080
       CHROMADB_URL: http://chromadb:8000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8084/health"]
+      interval: 15s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
     volumes:
       - chimere-engram:/data/engram
       - chimere-logs:/data/logs
@@ -108,7 +114,8 @@ services:
     volumes:
       - open-webui-data:/app/backend/data
     depends_on:
-      - odo
+      odo:
+        condition: service_healthy
     restart: unless-stopped
     networks:
       - chimere-net
@@ -141,6 +148,13 @@ services:
     build:
       context: ../../chimere-odo
       dockerfile: ../chimere/docker/nightly/Dockerfile
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     environment:
       NIGHTLY_SCHEDULE: ${NIGHTLY_SCHEDULE:-00:30}
       NIGHTLY_LORA: ${NIGHTLY_LORA:-true}
@@ -148,6 +162,7 @@ services:
       NIGHTLY_DSPY: ${NIGHTLY_DSPY:-false}
       NIGHTLY_MEZO: ${NIGHTLY_MEZO:-false}
       ODO_BACKEND: http://inference:8081
+      CHIMERE_HOME: /data
     volumes:
       - chimere-logs:/data/logs
       - chimere-engram:/data/engram
