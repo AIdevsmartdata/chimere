@@ -8,9 +8,9 @@
 set -e
 cd "$(dirname "$0")"
 
-export GGML_SO_DIR=/home/remondiere/ik_llama.cpp/build_sm120/ggml/src
-export GGML_INCLUDE_DIR=/home/remondiere/ik_llama.cpp/ggml/include
-export GGML_SRC_DIR=/home/remondiere/ik_llama.cpp/ggml/src
+export GGML_SO_DIR=${GGML_SO_DIR:-${IKLLAMACPP_DIR:-$HOME/ik_llama.cpp}/build_sm120/ggml/src}
+export GGML_INCLUDE_DIR=${GGML_INCLUDE_DIR:-${IKLLAMACPP_DIR:-$HOME/ik_llama.cpp}/ggml/include}
+export GGML_SRC_DIR=${GGML_SRC_DIR:-${IKLLAMACPP_DIR:-$HOME/ik_llama.cpp}/ggml/src}
 export CUDA_LIB_DIR=/usr/local/cuda-12.8/targets/x86_64-linux/lib
 export LD_LIBRARY_PATH=$GGML_SO_DIR:$CUDA_LIB_DIR:$LD_LIBRARY_PATH
 

@@ -3,7 +3,7 @@ title: Chimere Code Mode
 author: chimere-stack
 version: 1.0.0
 description: Pipe function that creates a "chimere-code" model in Open WebUI. Routes requests through ODO's code pipeline with structured reasoning, search context, and step-by-step plans displayed as collapsible Markdown sections.
-license: MIT
+license: Apache-2.0
 """
 
 import json

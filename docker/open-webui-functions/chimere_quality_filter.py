@@ -3,7 +3,7 @@ title: Chimere Quality Gate
 author: chimere-stack
 version: 1.0.0
 description: Filter function that scores each LLM response via the Chimere quality gate (ThinkPRM or Qwen3.5 heuristic scorer). Logs scores to quality_scores.jsonl and adds a low-confidence indicator when score <= 2.
-license: MIT
+license: Apache-2.0
 """
 
 import json

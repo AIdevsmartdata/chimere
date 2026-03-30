@@ -3,7 +3,7 @@ title: Chimere Engram Lookup
 author: chimere-stack
 version: 1.0.0
 description: Tool that allows the LLM to query Chimere's Engram tables for domain-specific knowledge. Engram stores validated n-gram patterns from high-quality responses, providing a local knowledge base for specialized domains (medical, cyber, code).
-license: MIT
+license: Apache-2.0
 """
 
 import json

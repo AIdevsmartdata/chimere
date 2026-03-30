@@ -3,7 +3,7 @@ title: Chimere Deep Search
 author: chimere-stack
 version: 1.0.0
 description: Deep web search tool for the Chimere Stack. Calls the SOTA 2026 deep search pipeline (SearXNG + Brave + ChromaDB + neural reranking) via ODO or directly via the search endpoint.
-license: MIT
+license: Apache-2.0
 """
 
 import json

@@ -3,12 +3,14 @@
 set -euo pipefail
 
 TARGET=100000
-FEATURES_DIR="/home/remondiere/chimere-dflash/data/features_q5"
-PROMPTS_V6="/home/remondiere/chimere-dflash/data/prompts_v6"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)/chimere-dflash"
+FEATURES_DIR="${BASE_DIR}/data/features_q5"
+PROMPTS_V6="${BASE_DIR}/data/prompts_v6"
 ORIG_INPUT="$PROMPTS_V6/ready_for_extraction.jsonl"
 MERGED_INPUT="$PROMPTS_V6/merged_all.jsonl"
 COMBINED_INPUT="$PROMPTS_V6/combined_for_extraction.jsonl"
-LOGFILE="/home/remondiere/chimere-dflash/extraction_monitor.log"
+LOGFILE="${BASE_DIR}/extraction_monitor.log"
 MODEL="$HOME/.openclaw/models/Qwen3.5-35B-A3B-GGUF/Qwen3.5-35B-A3B-UD-Q5_K_XL.gguf"
 
 log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOGFILE"; }
@@ -53,13 +55,13 @@ log "Combined input: $total_prompts prompts"
 orig_count=$(wc -l < "$ORIG_INPUT")
 log "Relaunching extraction from prompt index $orig_count (start of merged data)..."
 
-PYTHONUNBUFFERED=1 python /home/remondiere/chimere-dflash/scripts/extract_single_position.py \
+PYTHONUNBUFFERED=1 python "${SCRIPT_DIR}/extract_single_position.py" \
     --input "$COMBINED_INPUT" \
     --output "$FEATURES_DIR" \
     --model "$MODEL" \
     --max-seq-len 512 \
     --resume-from "$orig_count" \
-    >> /home/remondiere/chimere-dflash/extraction_phase2.log 2>&1 &
+    >> "${BASE_DIR}/extraction_phase2.log" 2>&1 &
 
 PHASE2_PID=$!
 log "Phase 2 extraction started (PID $PHASE2_PID)"
