@@ -21,26 +21,6 @@ if [ ! -f "${CHIMERE_MODEL}" ]; then
     exit 1
 fi
 
-# Build the command
-CMD="/usr/local/bin/llama-server"
-CMD="${CMD} --model ${CHIMERE_MODEL}"
-CMD="${CMD} --port ${CHIMERE_PORT}"
-CMD="${CMD} --ctx-size ${CHIMERE_CTX}"
-CMD="${CMD} --n-gpu-layers ${CHIMERE_NGL}"
-CMD="${CMD} --n-cpu-moe ${CHIMERE_NCMOE}"
-CMD="${CMD} --flash-attn ${CHIMERE_FLASH_ATTN}"
-CMD="${CMD} --cache-type-k ${CHIMERE_KV_K}"
-CMD="${CMD} --cache-type-v ${CHIMERE_KV_V}"
-CMD="${CMD} --parallel ${CHIMERE_NP}"
-CMD="${CMD} --host 0.0.0.0"
-CMD="${CMD} --metrics"
-CMD="${CMD} --jinja"
-
-# Append any extra arguments passed to the container
-if [ $# -gt 0 ]; then
-    CMD="${CMD} $*"
-fi
-
 echo "--- Chimere Inference ---"
 echo "Model:       ${CHIMERE_MODEL}"
 echo "Port:        ${CHIMERE_PORT}"
@@ -52,4 +32,20 @@ echo "KV cache:    K=${CHIMERE_KV_K} V=${CHIMERE_KV_V}"
 echo "Parallel:    ${CHIMERE_NP}"
 echo "-------------------------"
 
-exec ${CMD}
+# Build args as a proper set to avoid word-splitting issues
+set -- \
+    /usr/local/bin/llama-server \
+    --model "${CHIMERE_MODEL}" \
+    --port "${CHIMERE_PORT}" \
+    --ctx-size "${CHIMERE_CTX}" \
+    --n-gpu-layers "${CHIMERE_NGL}" \
+    --n-cpu-moe "${CHIMERE_NCMOE}" \
+    --flash-attn "${CHIMERE_FLASH_ATTN}" \
+    --cache-type-k "${CHIMERE_KV_K}" \
+    --cache-type-v "${CHIMERE_KV_V}" \
+    --parallel "${CHIMERE_NP}" \
+    --host 0.0.0.0 \
+    --metrics \
+    --jinja
+
+exec "$@"

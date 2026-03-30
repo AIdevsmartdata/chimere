@@ -18,7 +18,8 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENV_FILE="${REPO_ROOT}/.env"
 
 # Defaults
-DOCKER_VOLUME_NAME="chimere_chimere-models"
+# Volume name: <compose-project>_chimere-models. Project defaults to dir name.
+DOCKER_VOLUME_NAME="${COMPOSE_PROJECT_NAME:-docker}_chimere-models"
 LOCAL_MODEL_DIR=""
 FORCE=false
 QUANT_OVERRIDE=""

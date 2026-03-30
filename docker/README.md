@@ -48,14 +48,15 @@ GPU architecture). This takes 5-10 minutes. Subsequent starts are instant.
 
 ## What's Inside
 
-### 5 Containers
+### 6 Containers
 
 | Container | Image | Port | Purpose |
 |-----------|-------|------|---------|
 | **inference** | `chimere-inference` | 8081 | ik_llama.cpp server with full GPU offload, quantized KV cache, flash attention |
 | **odo** | `chimere-odo` | 8084 | Intelligent request router: intent classification, Engram injection, sampling profiles, SOUL.md personality |
 | **webui** | `open-webui` | 3000 | Chat interface with conversation history, file upload, code highlighting |
-| **searxng** | `searxng/searxng` | 8080 | Privacy-respecting meta-search engine for web grounding |
+| **searxng** | `searxng/searxng` | 8888 | Privacy-respecting meta-search engine for web grounding |
+| **chromadb** | `chromadb/chroma` | -- | Vector database for RAG knowledge retrieval |
 | **nightly** | `chimere-nightly` | -- | Overnight self-improvement: LoRA training, Engram updates, DSPy prompt optimization |
 
 ### How They Connect

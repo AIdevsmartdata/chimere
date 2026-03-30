@@ -19,7 +19,7 @@ FROM nvidia/cuda:12.8.0-devel-ubuntu24.04 AS builder
 
 ARG GPU_ARCH=120
 ARG IK_LLAMA_REPO=https://github.com/ikawrakow/ik_llama.cpp
-ARG IK_LLAMA_BRANCH=master
+ARG IK_LLAMA_BRANCH=main
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git \

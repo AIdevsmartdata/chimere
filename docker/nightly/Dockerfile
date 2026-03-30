@@ -3,8 +3,7 @@
 # Runs overnight LoRA training, Engram updates, and DSPy prompt optimization
 # on a configurable schedule.
 #
-# Build:
-#   docker build -t chimere-nightly -f docker/nightly/Dockerfile .
+# Build context: chimere-odo repo (set via docker-compose.yml)
 #
 # Run:
 #   docker run -d \
@@ -34,24 +33,15 @@ RUN mkdir -p \
     /data/soul \
     /app/scripts
 
-# Copy nightly scripts from chimere-odo
-COPY chimere-odo/quality/nightly_lora.py       /app/scripts/nightly_lora.py
-COPY chimere-odo/engram/engram_write_nightly.py /app/scripts/engram_write_nightly.py
-COPY chimere-odo/quality/dspy_optimize.py      /app/scripts/dspy_optimize.py
-COPY chimere-odo/quality/lora_mezo_nightly.py  /app/scripts/lora_mezo_nightly.py
-
-# Copy the scheduler
-COPY docker/nightly/scheduler.py /app/scheduler.py
+# Copy nightly scripts (build context = chimere-odo)
+COPY quality/nightly_lora.py        /app/scripts/nightly_lora.py
+COPY engram/engram_write_nightly.py /app/scripts/engram_write_nightly.py
+COPY quality/dspy_optimize.py       /app/scripts/dspy_optimize.py
+COPY quality/lora_mezo_nightly.py   /app/scripts/lora_mezo_nightly.py
+COPY quality/scheduler.py           /app/scheduler.py
 
 # ---------------------------------------------------------------------------
 # Schedule configuration
-# ---------------------------------------------------------------------------
-# NIGHTLY_SCHEDULE: time to run jobs (HH:MM in 24h format, local container TZ)
-# NIGHTLY_LORA:     enable LoRA training from quality-validated response pairs
-# NIGHTLY_ENGRAM:   enable Engram n-gram table updates from scored responses
-# NIGHTLY_DSPY:     enable DSPy MIPROv2 system-prompt optimization
-# NIGHTLY_MEZO:     enable MeZO zeroth-order LoRA (fits 16 GB, no backward pass)
-# ODO_BACKEND:      inference server URL (used by scripts for scoring/eval)
 # ---------------------------------------------------------------------------
 ENV NIGHTLY_SCHEDULE=00:30 \
     NIGHTLY_LORA=true \

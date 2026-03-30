@@ -20,7 +20,6 @@ volumes:
   chimere-engram:
   chimere-logs:
   chimere-soul:
-  chimere-pipelines:
   chimere-chromadb:
   open-webui-data:
 
@@ -84,7 +83,6 @@ services:
       - chimere-engram:/data/engram
       - chimere-logs:/data/logs
       - chimere-soul:/data/soul
-      - chimere-pipelines:/app/odo/pipelines
     depends_on:
       inference:
         condition: service_healthy
@@ -137,7 +135,32 @@ services:
       - chimere-net
 
   # ---------------------------------------------------------------------------
-  # 5. ChromaDB -- Vector database for RAG
+  # 5. Nightly -- Self-improvement (LoRA, Engram, DSPy) on a daily schedule
+  # ---------------------------------------------------------------------------
+  nightly:
+    build:
+      context: ../../chimere-odo
+      dockerfile: ../chimere/docker/nightly/Dockerfile
+    environment:
+      NIGHTLY_SCHEDULE: ${NIGHTLY_SCHEDULE:-00:30}
+      NIGHTLY_LORA: ${NIGHTLY_LORA:-true}
+      NIGHTLY_ENGRAM: ${NIGHTLY_ENGRAM:-true}
+      NIGHTLY_DSPY: ${NIGHTLY_DSPY:-false}
+      NIGHTLY_MEZO: ${NIGHTLY_MEZO:-false}
+      ODO_BACKEND: http://inference:8081
+    volumes:
+      - chimere-logs:/data/logs
+      - chimere-engram:/data/engram
+      - chimere-soul:/data/soul
+    depends_on:
+      inference:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - chimere-net
+
+  # ---------------------------------------------------------------------------
+  # 6. ChromaDB -- Vector database for RAG
   # ---------------------------------------------------------------------------
   chromadb:
     image: chromadb/chroma:latest
