@@ -46,6 +46,8 @@ set -- \
     --parallel "${CHIMERE_NP}" \
     --host 0.0.0.0 \
     --metrics \
-    --jinja
+    --jinja \
+    --alias chimere-default \
+    "$@"
 
 exec "$@"

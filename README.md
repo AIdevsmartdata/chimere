@@ -1,5 +1,7 @@
 # Chimere
 
+> **Warning**: This project is under active development and may contain bugs. Use at your own risk. OpenClaw and Chimere are provided as-is with no warranty. Contributions and bug reports welcome.
+
 **Rust-native MoE inference runtime + DFlash speculative decoding drafter for hybrid GDN/GQA language models on consumer Blackwell GPUs.**
 
 Chimere runs Qwen3.5-35B-A3B (35B total, ~3.5B active per token) at **93 tok/s** on a single RTX 5060 Ti 16GB with custom CUDA sm_120 kernels, IQ3_S dequantization, and multi-tier Engram memory.
