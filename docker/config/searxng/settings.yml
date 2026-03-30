@@ -1,0 +1,106 @@
+# =============================================================================
+# Chimere SearXNG Configuration
+#
+# Minimal config for ODO web search integration.
+# SearXNG is internal-only (not exposed to the internet).
+# =============================================================================
+
+use_default_settings: true
+
+general:
+  instance_name: "Chimere Search"
+  debug: false
+  enable_metrics: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "auto"
+  formats:
+    - html
+    - json
+
+server:
+  # Bind to all interfaces inside the container
+  bind_address: "0.0.0.0"
+  port: 8080
+  secret_key: "chimere-searxng-change-me-in-production"
+  limiter: false
+  public_instance: false
+  # JSON output is the primary mode for ODO integration
+  default_http_headers:
+    X-Content-Type-Options: nosniff
+    X-Robots-Tag: noindex, nofollow
+
+ui:
+  static_use_hash: true
+  default_theme: simple
+  results_on_new_tab: false
+
+# ---------------------------------------------------------------------------
+# Engines -- only enable the reliable ones ODO needs
+# ---------------------------------------------------------------------------
+engines:
+  # -- Web search engines --
+  - name: google
+    engine: google
+    shortcut: go
+    disabled: false
+
+  - name: bing
+    engine: bing
+    shortcut: bi
+    disabled: false
+
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
+
+  - name: brave
+    engine: brave
+    shortcut: br
+    disabled: false
+
+  # -- Knowledge / reference --
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    disabled: false
+
+  - name: wikidata
+    engine: wikidata
+    shortcut: wd
+    disabled: false
+
+  # -- Academic (useful for research pipeline) --
+  - name: arxiv
+    engine: arxiv
+    shortcut: ar
+    disabled: false
+
+  - name: google scholar
+    engine: google_scholar
+    shortcut: gs
+    disabled: false
+
+  # -- IT / code --
+  - name: github
+    engine: github
+    shortcut: gh
+    disabled: false
+
+  - name: stackoverflow
+    engine: stackoverflow
+    shortcut: so
+    disabled: false
+
+outgoing:
+  # Request timeout per engine (seconds)
+  request_timeout: 6.0
+  max_request_timeout: 15.0
+  # Pool connections for performance
+  pool_connections: 100
+  pool_maxsize: 20
+  # Basic privacy: no leaked referrer
+  enable_http2: true

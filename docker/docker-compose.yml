@@ -1,0 +1,151 @@
+# =============================================================================
+# Chimere Stack -- docker-compose.yml
+#
+# Full local AI stack: inference + ODO router + Web UI + search + vector DB.
+#
+# Quick start:
+#   1. ../scripts/detect-gpu.py          # writes ../.env
+#   2. ../scripts/download-model.sh      # downloads the right GGUF
+#   3. docker compose up -d              # bring the stack up
+#
+# The .env file at the repo root is loaded automatically by Compose.
+# =============================================================================
+
+networks:
+  chimere-net:
+    driver: bridge
+
+volumes:
+  chimere-models:
+  chimere-engram:
+  chimere-logs:
+  chimere-soul:
+  chimere-pipelines:
+  chimere-chromadb:
+  open-webui-data:
+
+services:
+  # ---------------------------------------------------------------------------
+  # 1. Inference -- ik_llama.cpp llama-server with GPU
+  # ---------------------------------------------------------------------------
+  inference:
+    build:
+      context: ..
+      dockerfile: docker/inference/Dockerfile
+      args:
+        GPU_ARCH: ${GPU_ARCH:-120}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    ports:
+      - "${INFERENCE_PORT:-8081}:8081"
+    environment:
+      CHIMERE_MODEL: /models/${MODEL_FILENAME:-model.gguf}
+      CHIMERE_CTX: ${CHIMERE_CTX:-32768}
+      CHIMERE_NGL: ${CHIMERE_NGL:-99}
+      CHIMERE_NCMOE: ${CHIMERE_NCMOE:-4}
+      CHIMERE_NP: ${CHIMERE_NP:-1}
+      CHIMERE_KV_K: ${CHIMERE_KV_K:-q8_0}
+      CHIMERE_KV_V: ${CHIMERE_KV_V:-q4_0}
+    volumes:
+      - chimere-models:/models
+      - chimere-engram:/data/engram
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 180s
+      retries: 5
+    restart: unless-stopped
+    networks:
+      - chimere-net
+
+  # ---------------------------------------------------------------------------
+  # 2. ODO -- One Door Orchestrator (intent routing, sampling, quality gate)
+  # ---------------------------------------------------------------------------
+  odo:
+    build:
+      context: ../../chimere-odo
+      dockerfile: Dockerfile
+    ports:
+      - "${ODO_PORT:-8084}:8084"
+    environment:
+      ODO_BACKEND: http://inference:8081
+      ODO_PORT: "8084"
+      SOUL_DIR: /data/soul
+      CHIMERE_HOME: /data
+      SEARXNG_URL: http://searxng:8080
+      CHROMADB_URL: http://chromadb:8000
+    volumes:
+      - chimere-engram:/data/engram
+      - chimere-logs:/data/logs
+      - chimere-soul:/data/soul
+      - chimere-pipelines:/app/odo/pipelines
+    depends_on:
+      inference:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - chimere-net
+
+  # ---------------------------------------------------------------------------
+  # 3. Open WebUI -- Chat interface
+  # ---------------------------------------------------------------------------
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    ports:
+      - "${WEBUI_PORT:-3000}:8080"
+    environment:
+      OPENAI_API_BASE_URLS: http://odo:8084/v1
+      OPENAI_API_KEYS: chimere-local
+      WEBUI_AUTH: "false"
+      ENABLE_RAG_WEB_SEARCH: "false"
+      DEFAULT_MODELS: chimere-default
+      ENABLE_SIGNUP: "false"
+      SAFE_MODE: "true"
+    volumes:
+      - open-webui-data:/app/backend/data
+    depends_on:
+      - odo
+    restart: unless-stopped
+    networks:
+      - chimere-net
+
+  # ---------------------------------------------------------------------------
+  # 4. SearXNG -- Meta-search engine (used by ODO for web search)
+  # ---------------------------------------------------------------------------
+  searxng:
+    image: searxng/searxng:latest
+    ports:
+      - "${SEARXNG_PORT:-8888}:8080"
+    volumes:
+      - ./config/searxng:/etc/searxng:rw
+    environment:
+      SEARXNG_BASE_URL: http://searxng:8080/
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+    restart: unless-stopped
+    networks:
+      - chimere-net
+
+  # ---------------------------------------------------------------------------
+  # 5. ChromaDB -- Vector database for RAG
+  # ---------------------------------------------------------------------------
+  chromadb:
+    image: chromadb/chroma:latest
+    volumes:
+      - chimere-chromadb:/chroma/chroma
+    environment:
+      IS_PERSISTENT: "TRUE"
+      ANONYMIZED_TELEMETRY: "FALSE"
+    restart: unless-stopped
+    networks:
+      - chimere-net
