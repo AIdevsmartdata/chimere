@@ -36,6 +36,7 @@ RUN mkdir -p \
 # Copy nightly scripts (build context = chimere-odo)
 COPY quality/nightly_lora.py        /app/scripts/nightly_lora.py
 COPY engram/engram_write_nightly.py /app/scripts/engram_write_nightly.py
+COPY engram/engram_ingest.py       /app/scripts/engram_ingest.py
 COPY quality/dspy_optimize.py       /app/scripts/dspy_optimize.py
 COPY quality/lora_mezo_nightly.py   /app/scripts/lora_mezo_nightly.py
 COPY quality/scheduler.py           /app/scheduler.py
@@ -52,7 +53,7 @@ ENV NIGHTLY_SCHEDULE=00:30 \
     PYTHONUNBUFFERED=1
 
 # Log and data volumes
-VOLUME ["/data/logs", "/data/engram", "/data/soul"]
+VOLUME ["/data/logs", "/data/engram"]
 
 WORKDIR /app
 
