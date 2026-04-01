@@ -154,9 +154,14 @@ fn main() {
     // Common linking
     // -----------------------------------------------------------------------
 
-    // Link against libggml.so
+    // Link against libggml.so + libllama.so from ik_llama
+    let llama_so_dir = env::var("LLAMA_SO_DIR")
+        .unwrap_or_else(|_| format!("{}/../src", ggml_so_dir));
     println!("cargo:rustc-link-search=native={}", ggml_so_dir);
+    println!("cargo:rustc-link-search=native={}", llama_so_dir);
     println!("cargo:rustc-link-lib=dylib=ggml");
+    println!("cargo:rustc-link-lib=dylib=llama");
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", llama_so_dir);
 
     // libggml.so depends on CUDA runtime
     let cuda_lib_dir = env::var("CUDA_LIB_DIR")

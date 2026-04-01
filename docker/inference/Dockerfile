@@ -1,97 +1,62 @@
-# =============================================================================
-# Chimere Inference Container
-# Runs ik_llama.cpp llama-server with full GPU acceleration.
-#
-# Build:
-#   docker build -t chimere-inference -f docker/inference/Dockerfile .
-#   docker build --build-arg GPU_ARCH=89 -t chimere-inference .
-#
-# Run:
-#   docker run --gpus all -v /path/to/models:/models \
-#     -e CHIMERE_MODEL=/models/model.gguf \
-#     -p 8081:8081 chimere-inference
-# =============================================================================
-
-# ---------------------------------------------------------------------------
-# Stage 1: Build ik_llama.cpp
-# ---------------------------------------------------------------------------
 FROM nvidia/cuda:12.8.0-devel-ubuntu24.04 AS builder
 
-ARG GPU_ARCH=120
-ARG IK_LLAMA_REPO=https://github.com/ikawrakow/ik_llama.cpp
-ARG IK_LLAMA_BRANCH=main
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        git \
-        cmake \
-        ninja-build \
-        build-essential \
-        libcurl4-openssl-dev \
+RUN apt-get update && apt-get install -y \
+    curl git cmake build-essential pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# Build ik_llama.cpp (FFI backend)
 WORKDIR /build
+RUN git clone --depth 1 https://github.com/ikawrakow/ik_llama.cpp.git
+WORKDIR /build/ik_llama.cpp
+RUN mkdir build && cd build && cmake .. \
+    -DCMAKE_CUDA_ARCHITECTURES="89;120" \
+    -DGGML_CUDA=ON \
+    -DGGML_NATIVE=OFF \
+    -DBUILD_SHARED_LIBS=ON \
+    -DCMAKE_BUILD_TYPE=Release \
+    && cmake --build . -j$(nproc) --target llama ggml
 
-RUN git clone --depth 1 --branch ${IK_LLAMA_BRANCH} ${IK_LLAMA_REPO} ik_llama
+# Copy chimere source
+COPY chimere-server /build/chimere-server
+WORKDIR /build/chimere-server
 
-WORKDIR /build/ik_llama
+# Build chimere-server with ik_llama FFI
+ENV GGML_SO_DIR=/build/ik_llama.cpp/build/ggml/src
+ENV GGML_INCLUDE_DIR=/build/ik_llama.cpp/ggml/include
+ENV GGML_SRC_DIR=/build/ik_llama.cpp/ggml/src
+ENV GGML_COMMON_DIR=/build/ik_llama.cpp/common
+ENV GGML_COMMON_LIB_DIR=/build/ik_llama.cpp/build/common
+ENV IK_LLAMA_INCLUDE=/build/ik_llama.cpp/include
+ENV IK_LLAMA_SRC=/build/ik_llama.cpp/src
+ENV LLAMA_SO_DIR=/build/ik_llama.cpp/build/src
+ENV CUDA_HOME=/usr/local/cuda
 
-RUN cmake -B build -G Ninja \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DGGML_CUDA=ON \
-        -DCMAKE_CUDA_ARCHITECTURES=${GPU_ARCH} \
-        -DGGML_NATIVE=OFF \
-        -DLLAMA_SERVER=ON \
-        -DLLAMA_CURL=ON \
-    && cmake --build build --target llama-server -j "$(nproc)"
+RUN cargo build --release --features server
 
-# Collect the binary and its shared library dependencies from the build tree
-# so the runtime stage only needs the CUDA runtime base image.
-RUN mkdir -p /dist/lib \
-    && cp build/bin/llama-server /dist/ \
-    && ldd /dist/llama-server \
-        | grep -oP '/build/\S+' \
-        | xargs -I{} cp {} /dist/lib/ 2>/dev/null || true
+# --- Runtime stage ---
+FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
 
-# ---------------------------------------------------------------------------
-# Stage 2: Runtime
-# ---------------------------------------------------------------------------
-FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04 AS runtime
+RUN apt-get update && apt-get install -y libgomp1 curl && rm -rf /var/lib/apt/lists/*
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl \
-        ca-certificates \
-        libcurl4 \
-        libgomp1 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy server binary and any build-tree shared libs
-COPY --from=builder /dist/llama-server /usr/local/bin/llama-server
-COPY --from=builder /dist/lib/ /usr/local/lib/
+COPY --from=builder /build/chimere-server/target/release/chimere-server /usr/local/bin/
+COPY --from=builder /build/ik_llama.cpp/build/src/libllama.so /usr/local/lib/
+COPY --from=builder /build/ik_llama.cpp/build/ggml/src/libggml.so /usr/local/lib/
 RUN ldconfig
 
-# Entrypoint script
-COPY docker/inference/entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+ENV CHIMERE_PORT=8081
+ENV CHIMERE_LLAMA_BACKEND=1
+ENV CHIMERE_NCMOE=4
+ENV CHIMERE_KV_MAX_SEQ=32768
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
 
-# Create model mount point
-RUN mkdir -p /models
-
-# Environment defaults
-ENV CHIMERE_MODEL=/models/model.gguf \
-    CHIMERE_PORT=8081 \
-    CHIMERE_CTX=32768 \
-    CHIMERE_NGL=99 \
-    CHIMERE_NCMOE=4 \
-    CHIMERE_FLASH_ATTN=on \
-    CHIMERE_KV_K=q8_0 \
-    CHIMERE_KV_V=q4_0 \
-    CHIMERE_NP=1
-
-# Expose the default server port
 EXPOSE 8081
 
-# Health check: llama-server /health endpoint
-HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
-    CMD curl -f http://localhost:${CHIMERE_PORT}/health || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD curl -sf http://localhost:8081/health || exit 1
 
-ENTRYPOINT ["entrypoint.sh"]
+ENTRYPOINT ["chimere-server"]
