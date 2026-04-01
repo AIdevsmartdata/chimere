@@ -1,6 +1,4 @@
-# ═══════════════════════════════════════════════════════════════
 # Chimere Server — Build it and test it
-# ═══════════════════════════════════════════════════════════════
 FROM nvidia/cuda:12.8.0-devel-ubuntu24.04 AS builder
 
 RUN apt-get update && apt-get install -y \
@@ -10,19 +8,17 @@ RUN apt-get update && apt-get install -y \
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Build inference backend (all targets including common)
 WORKDIR /build
 RUN git clone --depth 1 https://github.com/ikawrakow/ik_llama.cpp.git /build/backend
 WORKDIR /build/backend/build
 RUN cmake .. \
-    -DCMAKE_CUDA_ARCHITECTURES="89;120" \
+    -DCMAKE_CUDA_ARCHITECTURES="120" \
     -DGGML_CUDA=ON \
     -DGGML_NATIVE=OFF \
     -DBUILD_SHARED_LIBS=ON \
     -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build . -j$(nproc)
+    && cmake --build . -j4
 
-# Build Chimere server
 COPY chimere-server /build/chimere-server
 WORKDIR /build/chimere-server
 
@@ -38,11 +34,7 @@ ENV CUDA_HOME=/usr/local/cuda
 
 RUN cargo build --release --features server
 
-# ═══════════════════════════════════════════════════════════════
-# Runtime
-# ═══════════════════════════════════════════════════════════════
 FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
-
 RUN apt-get update && apt-get install -y libgomp1 curl && rm -rf /var/lib/apt/lists/*
 RUN useradd -r -s /usr/sbin/nologin chimere
 
@@ -52,20 +44,11 @@ COPY --from=builder /build/backend/build/ggml/src/libggml.so /usr/local/lib/
 RUN ldconfig
 
 USER chimere
-
-ENV CHIMERE_PORT=8081
-ENV CHIMERE_LLAMA_BACKEND=1
-ENV CHIMERE_NCMOE=4
-ENV CHIMERE_KV_MAX_SEQ=32768
-ENV CHIMERE_BATCH=4096
-ENV CHIMERE_UBATCH=512
-ENV CHIMERE_THREADS=8
-ENV NVIDIA_VISIBLE_DEVICES=all
-ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
-
+ENV CHIMERE_PORT=8081 CHIMERE_LLAMA_BACKEND=1 CHIMERE_NCMOE=4 \
+    CHIMERE_KV_MAX_SEQ=32768 CHIMERE_BATCH=4096 CHIMERE_UBATCH=512 \
+    CHIMERE_THREADS=8 NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
 EXPOSE 8081
-
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD curl -sf http://localhost:8081/health || exit 1
-
 ENTRYPOINT ["chimere-server"]
