@@ -443,8 +443,14 @@ impl LlamaForward {
         // --- Context params ---
         let mut cparams = unsafe { llama_context_default_params() };
         cparams.n_ctx = n_ctx;
-        cparams.n_batch = 4096; // Match ik_llama production: -b 4096
-        cparams.n_ubatch = 512; // Match ik_llama production: -ub 512
+        cparams.n_batch = std::env::var("CHIMERE_BATCH")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
+        cparams.n_ubatch = std::env::var("CHIMERE_UBATCH")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(512);
+        cparams.n_threads = std::env::var("CHIMERE_THREADS")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(14);
+        cparams.n_threads_batch = std::env::var("CHIMERE_THREADS_BATCH")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(14);
         cparams.flash_attn = flash_attn;
         cparams.offload_kqv = true;
         // KV cache types: default to production settings (q8_0 keys, q4_0 values)
@@ -674,8 +680,9 @@ impl LlamaForward {
         let n = tokens.len();
         let mut toks: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
 
-        // Process in chunks of n_batch (4096) to respect the batch size limit.
-        let n_batch = 4096usize;
+        // Process in chunks of n_batch to respect the batch size limit.
+        let n_batch = std::env::var("CHIMERE_BATCH")
+            .ok().and_then(|s| s.parse().ok()).unwrap_or(4096usize);
         let mut last_logits: Option<Vec<f32>> = None;
 
         let mut offset = 0;
