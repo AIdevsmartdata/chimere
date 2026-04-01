@@ -1,0 +1,22 @@
+# Chimere Server — Pre-built binary (use this if full build OOMs)
+# Build the binary locally first: cd chimere-server && cargo build --release --features server
+FROM nvidia/cuda:12.8.0-runtime-ubuntu24.04
+
+RUN apt-get update && apt-get install -y libgomp1 curl && rm -rf /var/lib/apt/lists/*
+RUN useradd -r -s /usr/sbin/nologin chimere
+
+# Copy pre-built binaries (built on host with CUDA 12.8 + sm_120)
+COPY chimere-server/target/release/chimere-server /usr/local/bin/
+COPY libs/libllama.so /usr/local/lib/
+COPY libs/libggml.so /usr/local/lib/
+RUN ldconfig
+
+USER chimere
+ENV CHIMERE_PORT=8081 CHIMERE_LLAMA_BACKEND=1 CHIMERE_NCMOE=4 \
+    CHIMERE_KV_MAX_SEQ=32768 CHIMERE_BATCH=4096 CHIMERE_UBATCH=512 \
+    CHIMERE_THREADS=8 NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+EXPOSE 8081
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD curl -sf http://localhost:8081/health || exit 1
+ENTRYPOINT ["chimere-server"]
