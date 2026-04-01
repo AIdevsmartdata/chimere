@@ -1,94 +1,198 @@
 # Chimere
 
-**Rust inference engine with ik_llama FFI backend for Blackwell GPUs.**
+**The first self-improving Rust inference engine for MoE language models.**
 
-Chimere is a specialized inference engine for mixture-of-experts language models. It wraps [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) via FFI for optimized CUDA inference and adds Engram memory, custom sampling (DRY penalty), entropy routing, and multi-token prediction on top.
+Chimere is a complete inference stack that runs Qwen3.5-35B-A3B (256 experts, ~3.5B active params/token) at **80 tok/s on a single RTX 5060 Ti** (16 GB VRAM). It combines a Rust runtime with Engram hierarchical memory, entropy-adaptive routing, custom sampling, and an orchestration layer (ODO) that classifies intent and routes to specialized pipelines — all self-improving nightly via LoRA and Engram updates.
 
-**80 tok/s generation, 789 tok/s prefill** on a single RTX 5060 Ti (16 GB VRAM) with sm_120 CUDA kernels.
+**No one else does this.** Existing solutions (vLLM, llama.cpp, TGI) are inference-only. Chimere is inference + intelligence: Engram injects domain knowledge at inference time, ODO routes prompts to specialized adapters, and the nightly pipeline learns from usage to improve quality over time.
 
-## Chimere Distilled Models
+## Build it and test it
 
-We distilled Claude Opus 4.6 into Qwen3.5-35B-A3B (MoE, 256 experts, ~3.5B active params/token). This is the **first Opus distillation targeting a MoE architecture**.
+```bash
+# Clone
+git clone https://github.com/AIdevsmartdata/chimere.git
+cd chimere
 
-### Final Benchmark Results
+# Docker (recommended) — full stack: Chimere + ODO + Web UI + Search
+docker compose -f docker/docker-compose.yml up -d
+
+# Or build from source (requires CUDA 12.8 + Rust)
+cd chimere-server && cargo build --release --features server
+```
+
+Then download a model:
+```bash
+# Chimere v3 — Opus-distilled, 100% IFEval, 84% GSM8K
+huggingface-cli download Kevletesteur/Qwen3.5-35B-A3B-Chimere-v3-GGUF chimere-v3-ramp.gguf
+
+# Start
+CHIMERE_MODEL=chimere-v3-ramp.gguf CHIMERE_LLAMA_BACKEND=1 chimere-server
+```
+
+## Chimere Distilled Models — Opus into MoE
+
+We distilled **Claude Opus 4.6** into Qwen3.5-35B-A3B. This is the **first Opus distillation targeting a MoE architecture** (256 experts, hybrid SSM+attention). Two variants trained on different dataset compositions:
 
 | Benchmark | v1 RAMP (15 GB) | v3 RAMP (15 GB) | Base Qwen3.5 |
 |-----------|-----------------|-----------------|-------------|
-| **GSM8K CoT 8-shot** (lm-eval, 1319 qs) | 52.2% | **84.0%** | -- |
-| **HumanEval** (30 problems, executed) | **97%** | 83% | -- |
-| **BFCL tool-calling** (20 questions) | **90%** | 75% | 67.3% |
+| **GSM8K** (1319 qs, CoT 8-shot) | 52.2% | **84.0%** | -- |
+| **HumanEval** (30 problems) | **97%** | 83% | -- |
+| **BFCL tool-calling** (20 qs) | **90%** | 75% | 67.3% |
 | **IFEval** (15 instruction tests) | 67% | **100%** | ~91.9% |
-| **Edge cases** (15 adversarial tests) | 87% | **100%** | -- |
-| **Speed** (RTX 5060 Ti) | 80 tok/s | 80 tok/s | ~75 tok/s |
-| **Speed** (B200) | 154 tok/s | 152 tok/s | -- |
-| **Prefill** (RTX 5060 Ti) | 789 tok/s | 789 tok/s | -- |
-| **TTFT** | 80ms | 80ms | -- |
+| **Edge cases** (15 adversarial) | 87% | **100%** | -- |
 
-#### Qualitative Agentique Tests (3 complex real-world scenarios)
+### Performance (RTX 5060 Ti, 16 GB VRAM)
 
-| Scenario | v1 | v3 | Max |
-|----------|----|----|-----|
-| Cybersecurity incident response (multi-tool chain) | 4 | 4 | 10 |
-| ML pipeline architecture (RAG, 10K users) | 8 | 8 | 10 |
-| Rust MoE runtime optimization | 7 | 8 | 10 |
-| **Total** | **19** | **20** | **30** |
+| Metric | Value |
+|--------|-------|
+| **Generation** | 80 tok/s |
+| **Prefill** | 789 tok/s |
+| **TTFT** | 80ms |
+| **Context** | 64K tokens |
+| **VRAM** | 15.3 GB (560 MB free) |
 
-**Key finding:** v1 best for code+tools (97% HumanEval, 90% BFCL), v3 best for instructions+reasoning (100% IFEval, 84% GSM8K). A-LoRA routing (ODO classifies intent and selects the appropriate LoRA) gives the best of both.
+v1 = best for code + tool-calling (97% HumanEval, 90% BFCL). v3 = best for instructions + reasoning (100% IFEval, 84% GSM8K). ODO routes to the right adapter automatically.
 
 ### Download
 
 | Model | Size | Best for | Link |
 |-------|------|----------|------|
-| **v1 RAMP GGUF** | 15 GB | Code + tool-calling | [Kevletesteur/Qwen3.5-35B-A3B-Chimere-Distilled-GGUF](https://huggingface.co/Kevletesteur/Qwen3.5-35B-A3B-Chimere-Distilled-GGUF) |
-| **v3 RAMP GGUF** | 15 GB | Instructions + reasoning | [Kevletesteur/Qwen3.5-35B-A3B-Chimere-v3-GGUF](https://huggingface.co/Kevletesteur/Qwen3.5-35B-A3B-Chimere-v3-GGUF) |
-| BF16 | 65 GB | Full precision | [Kevletesteur/Qwen3.5-35B-A3B-Chimere-Distilled-BF16](https://huggingface.co/Kevletesteur/Qwen3.5-35B-A3B-Chimere-Distilled-BF16) |
-| LoRA adapter | 15 GB | Fine-tuning | [Kevletesteur/Qwen3.5-35B-A3B-Chimere-Distilled-LoRA](https://huggingface.co/Kevletesteur/Qwen3.5-35B-A3B-Chimere-Distilled-LoRA) |
-
-### Quick Start
-
-```bash
-# With llama.cpp / llama-server
-llama-server \
-    -m Qwen3.5-35B-A3B-Chimere-Distilled-RAMP-v3.gguf \
-    -ngl 99 --n-cpu-moe 4 -c 32768 --jinja --port 8081
-```
-
-Runs at ~90 tok/s on RTX 5060 Ti (16 GB VRAM) with `-ngl 99 --n-cpu-moe 4`.
+| **v1 RAMP** | 15 GB | Code + tools | [HuggingFace](https://huggingface.co/Kevletesteur/Qwen3.5-35B-A3B-Chimere-Distilled-GGUF) |
+| **v3 RAMP** | 15 GB | Instructions + reasoning | [HuggingFace](https://huggingface.co/Kevletesteur/Qwen3.5-35B-A3B-Chimere-v3-GGUF) |
+| BF16 | 65 GB | Full precision | [HuggingFace](https://huggingface.co/Kevletesteur/Qwen3.5-35B-A3B-Chimere-Distilled-BF16) |
+| LoRA | 15 GB | Fine-tuning | [HuggingFace](https://huggingface.co/Kevletesteur/Qwen3.5-35B-A3B-Chimere-Distilled-LoRA) |
 
 ---
 
-## Inference Runtime
+## Architecture
 
-### Architecture
+```
+User → ODO (intent classification + routing) → Chimere Server
+                                                    ├── Engram (hierarchical memory codebook)
+                                                    ├── Custom sampling (DRY, temperature, entropy-aware)
+                                                    ├── CUDA inference (sm_120 Blackwell kernels)
+                                                    ├── A-LoRA hot-swap (conversation/code/tools adapters)
+                                                    └── MTP speculative decoding
+                                                          ↓
+                                               Nightly pipeline (self-improvement)
+                                                    ├── Training pair logging
+                                                    ├── LoRA fine-tune on usage data
+                                                    └── Engram codebook update (MDL compression)
+```
 
-- **chimere-server**: Rust inference engine (56K lines) — hybrid attention, expert routing, memory management
-- **chimere-dflash**: Speculative decoding module (Python/C++, 22K lines)
-- **patches/ik-llama-mtp**: Enhancement patches for upstream integration
+### Chimere Server (Rust)
 
-### Technical Features
+The inference engine. Loads GGUF models, manages KV cache, runs generation with custom sampling. OpenAI-compatible API (`/v1/chat/completions`).
 
-- Hybrid attention combining group-distributed and grouped-query approaches
-- Custom sm_120 CUDA kernels for quantized operations
-- Multi-tiered Engram memory system (cuckoo filters + semantic indexing)
-- Entropy-based computational routing
-- DFlash speculative decoding (+47% vs original paper)
+**Key features no other engine has:**
+- **Engram** — hierarchical memory codebook in Poincaré hyperbolic space. Entries near the origin = general concepts, near the boundary = specialized details. Injected at inference time, not just in the prompt.
+- **Entropy routing** — dynamically switches between attention mechanisms based on sequence entropy
+- **Custom sampling** — DRY penalty (anti-repetition), Engram-aware temperature, min-p
+- **MTP** — multi-token prediction for speculative decode (+49.5% acceptance rate)
 
-### RAMP Quantization
+### ODO — One Door Orchestrator
 
-Custom per-tensor quantization recipe:
-- Critical paths (attention values, SSM params): Q8_0 / Q6_K
-- MoE experts (256 per layer): IQ3_S
-- Result: **15 GB** with zero quality loss on agentic benchmarks
+Intent classifier + routing proxy. Classifies each prompt and routes to the right pipeline (code, research, kine, cyber, default) with appropriate:
+- Thinking mode (enabled/disabled per route)
+- Engram injection (domain-specific knowledge)
+- Sampling profile (temperature, top_p per route)
+- System prompt consolidation
+- ABF (Adaptive Batch Formation)
 
-### Requirements
+### Nightly Pipeline
 
-- CUDA 12.8+ (Blackwell sm_120 native)
-- ik_llama.cpp for server component
-- 16 GB VRAM minimum (RTX 4080/5060 Ti class)
+Self-improvement loop that runs daily:
+1. Collects training pairs from ODO logs
+2. LoRA fine-tune on high-quality pairs
+3. Engram codebook update (MDL-gated: only adds entries when prediction error exceeds threshold)
+4. Quality benchmarks to detect regression
+
+---
+
+## Configuration
+
+All settings via environment variables:
+
+### Model & Backend
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CHIMERE_MODEL` | (required) | Path to GGUF model |
+| `CHIMERE_TOKENIZER` | auto-detect | Path to tokenizer.json |
+| `CHIMERE_LLAMA_BACKEND` | unset | Enable optimized FFI backend |
+
+### Inference
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CHIMERE_NCMOE` | 4 | MoE expert layers on CPU (0=all GPU) |
+| `CHIMERE_KV_MAX_SEQ` | 65536 | Context length |
+| `CHIMERE_BATCH` | 4096 | Batch size for prefill |
+| `CHIMERE_UBATCH` | 512 | Micro-batch for decode |
+| `CHIMERE_THREADS` | 14 | CPU threads |
+
+### KV Cache
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CHIMERE_KV_TYPE_K` | 8 (q8_0) | Key cache quantization |
+| `CHIMERE_KV_TYPE_V` | 2 (q4_0) | Value cache quantization |
+| `CHIMERE_KV_HADAMARD` | 1 | Hadamard rotation on keys |
+| `CHIMERE_FLASH_ATTN` | 1 | Flash attention |
+
+### Server
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CHIMERE_PORT` | 8090 | API port |
+| `CHIMERE_MAX_AGENTS` | 4 | Max concurrent requests |
+
+### RAMP Quantization Sweet Spots (RTX 5060 Ti 16 GB)
+
+| ncmoe | Context | Gen tok/s | VRAM free | Recommendation |
+|-------|---------|-----------|-----------|----------------|
+| 4 | 64K | 77 | 702 MB | Safe, production |
+| **3** | **64K** | **80** | **560 MB** | **Recommended** |
+| 2 | 64K | OOM | -- | Not viable on 16 GB |
+| 4 | 32K | 80 | 1.2 GB | Maximum headroom |
+
+---
+
+## Requirements
+
+- **GPU**: NVIDIA with 16+ GB VRAM (RTX 4080/5060 Ti/5070 Ti/5080 or better)
+- **CUDA**: 12.8+ for Blackwell (sm_120). 12.4+ for Ada (sm_89)
+- **RAM**: 32 GB recommended (MoE experts offloaded to CPU)
+- **Rust**: 1.80+ (for build from source)
+
+## Docker Stack
+
+The `docker-compose.yml` brings up the full stack:
+
+| Service | Port | Description |
+|---------|------|-------------|
+| **chimere** | 8081 | Inference engine |
+| **odo** | 8084 | Intent router + orchestrator |
+| **open-webui** | 3000 | Chat UI |
+| **searxng** | 8888 | Web search |
+| **chromadb** | (internal) | Vector DB for RAG |
+| **nightly** | (internal) | Self-improvement pipeline |
+
+```bash
+# Download model first
+mkdir -p models && cd models
+huggingface-cli download Kevletesteur/Qwen3.5-35B-A3B-Chimere-v3-GGUF chimere-v3-ramp.gguf
+# Also need tokenizer
+huggingface-cli download Qwen/Qwen3.5-35B-A3B tokenizer.json
+
+# Start everything
+cd .. && docker compose -f docker/docker-compose.yml up -d
+
+# Test
+curl http://localhost:8081/health
+curl http://localhost:8084/routes
+```
 
 ## Related Projects
 
-- [chimere-odo](https://github.com/AIdevsmartdata/chimere-odo) — Inference orchestrator (intent classification, routing, quality gating)
+- [chimere-odo](https://github.com/AIdevsmartdata/chimere-odo) — ODO orchestrator
+- [Chimere v3 RAMP GGUF](https://huggingface.co/Kevletesteur/Qwen3.5-35B-A3B-Chimere-v3-GGUF) — Opus-distilled model
 
 ## License
 

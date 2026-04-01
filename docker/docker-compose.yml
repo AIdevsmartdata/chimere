@@ -25,14 +25,12 @@ volumes:
 
 services:
   # ---------------------------------------------------------------------------
-  # 1. Inference -- ik_llama.cpp llama-server with GPU
+  # 1. Chimere Server -- Rust inference engine with Engram + custom sampling
   # ---------------------------------------------------------------------------
-  inference:
+  chimere:
     build:
       context: ..
       dockerfile: docker/inference/Dockerfile
-      args:
-        GPU_ARCH: ${GPU_ARCH:-120}
     deploy:
       resources:
         reservations:
@@ -41,15 +39,20 @@ services:
               count: 1
               capabilities: [gpu]
     ports:
-      - "${INFERENCE_PORT:-8081}:8081"
+      - "${CHIMERE_PORT:-8081}:8081"
     environment:
       CHIMERE_MODEL: /models/${MODEL_FILENAME:-model.gguf}
-      CHIMERE_CTX: ${CHIMERE_CTX:-32768}
-      CHIMERE_NGL: ${CHIMERE_NGL:-99}
+      CHIMERE_TOKENIZER: /models/tokenizer.json
+      CHIMERE_PORT: "8081"
+      CHIMERE_LLAMA_BACKEND: "1"
+      CHIMERE_KV_MAX_SEQ: ${CHIMERE_CTX:-32768}
       CHIMERE_NCMOE: ${CHIMERE_NCMOE:-4}
-      CHIMERE_NP: ${CHIMERE_NP:-1}
-      CHIMERE_KV_K: ${CHIMERE_KV_K:-q8_0}
-      CHIMERE_KV_V: ${CHIMERE_KV_V:-q4_0}
+      CHIMERE_KV_TYPE_K: "8"
+      CHIMERE_KV_TYPE_V: "2"
+      CHIMERE_FLASH_ATTN: "1"
+      CHIMERE_BATCH: ${CHIMERE_BATCH:-4096}
+      CHIMERE_UBATCH: ${CHIMERE_UBATCH:-512}
+      CHIMERE_THREADS: ${CHIMERE_THREADS:-8}
     volumes:
       - chimere-models:/models
       - chimere-engram:/data/engram
@@ -73,7 +76,7 @@ services:
     ports:
       - "${ODO_PORT:-8084}:8084"
     environment:
-      ODO_BACKEND: http://inference:8081
+      ODO_BACKEND: http://chimere:8081
       ODO_PORT: "8084"
       SOUL_DIR: /data/soul
       CHIMERE_HOME: /data
@@ -90,7 +93,7 @@ services:
       - chimere-logs:/data/logs
       - chimere-soul:/data/soul
     depends_on:
-      inference:
+      chimere:
         condition: service_healthy
     restart: unless-stopped
     networks:
@@ -161,14 +164,14 @@ services:
       NIGHTLY_ENGRAM: ${NIGHTLY_ENGRAM:-true}
       NIGHTLY_DSPY: ${NIGHTLY_DSPY:-false}
       NIGHTLY_MEZO: ${NIGHTLY_MEZO:-false}
-      ODO_BACKEND: http://inference:8081
+      ODO_BACKEND: http://chimere:8081
       CHIMERE_HOME: /data
     volumes:
       - chimere-logs:/data/logs
       - chimere-engram:/data/engram
       - chimere-soul:/data/soul
     depends_on:
-      inference:
+      chimere:
         condition: service_healthy
     restart: unless-stopped
     networks:

@@ -149,6 +149,7 @@ where D: serde::Deserializer<'de> {
 fn default_max_tokens() -> usize {
     2048
 }
+const MAX_TOKENS_LIMIT: usize = 32768;
 fn default_temperature() -> f64 {
     0.7
 }
@@ -640,7 +641,7 @@ async fn chat_completions_non_stream(
 
     // Thinking budget is handled inside generate_with_mtp (detects </think> token).
     // max_tokens applies to the RESPONSE only — thinking has its own budget (8192 default).
-    let total_budget = req.max_tokens;
+    let total_budget = req.max_tokens.min(MAX_TOKENS_LIMIT);
     let want_logprobs = req.logprobs;
     let top_logprobs_n = req.top_logprobs.unwrap_or(5).min(5); // FFI max is 5
 
@@ -774,7 +775,7 @@ async fn chat_completions_stream(
         .map(|k| k.enable_thinking)
         .unwrap_or(true);
     let prompt = messages_to_prompt(&req.messages, req.tools.as_ref(), enable_thinking);
-    let max_tokens = req.max_tokens;
+    let max_tokens = req.max_tokens.min(MAX_TOKENS_LIMIT);
     let params = SamplingParams {
         temperature: req.temperature,
         top_p: req.top_p,
