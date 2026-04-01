@@ -12,7 +12,7 @@ WORKDIR /build
 RUN git clone --depth 1 https://github.com/ikawrakow/ik_llama.cpp.git /build/backend
 WORKDIR /build/backend/build
 RUN cmake .. \
-    -DCMAKE_CUDA_ARCHITECTURES="120" \
+    -DCMAKE_CUDA_ARCHITECTURES="89;120" \
     -DGGML_CUDA=ON \
     -DGGML_NATIVE=OFF \
     -DBUILD_SHARED_LIBS=ON \
