@@ -12,12 +12,12 @@ WORKDIR /build
 RUN git clone --depth 1 https://github.com/ikawrakow/ik_llama.cpp.git /build/backend
 WORKDIR /build/backend/build
 RUN cmake .. \
-    -DCMAKE_CUDA_ARCHITECTURES="120" \
+    -DCMAKE_CUDA_ARCHITECTURES="89" \
     -DGGML_CUDA=ON \
     -DGGML_NATIVE=OFF \
     -DBUILD_SHARED_LIBS=ON \
     -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build . -j4
+    && cmake --build . -j2
 
 COPY chimere-server /build/chimere-server
 WORKDIR /build/chimere-server
