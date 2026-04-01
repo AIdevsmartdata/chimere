@@ -1,14 +1,22 @@
 # =============================================================================
-# Chimere Stack -- docker-compose.yml
+# Chimere Stack — The self-improving AI inference engine
 #
-# Full local AI stack: inference + ODO router + Web UI + search + vector DB.
+# Full stack: Chimere inference + ODO routing + DVTS verification +
+#             search augmentation (CRAG) + nightly self-improvement +
+#             Web UI + vector DB
 #
 # Quick start:
-#   1. ../scripts/detect-gpu.py          # writes ../.env
-#   2. ../scripts/download-model.sh      # downloads the right GGUF
-#   3. docker compose up -d              # bring the stack up
+#   1. Download model: huggingface-cli download Kevletesteur/Qwen3.5-35B-A3B-Chimere-v3-GGUF chimere-v3-ramp.gguf
+#   2. docker compose up -d
+#   3. Open http://localhost:3000 (Web UI)
 #
-# The .env file at the repo root is loaded automatically by Compose.
+# Architecture:
+#   User → Open WebUI (3000) → ODO (8084) → Chimere (8081)
+#                                  ├── SearXNG (deep search, CRAG)
+#                                  ├── ChromaDB (RAG, vector search)
+#                                  ├── DVTS (verification, ThinkPRM scorer)
+#                                  └── Engram (hierarchical memory)
+#                               Nightly (00:30) → LoRA + Engram + GRPO + DSPy
 # =============================================================================
 
 networks:
@@ -21,6 +29,8 @@ volumes:
   chimere-logs:
   chimere-soul:
   chimere-chromadb:
+  chimere-training:
+  chimere-search-cache:
   open-webui-data:
 
 services:
@@ -67,7 +77,9 @@ services:
       - chimere-net
 
   # ---------------------------------------------------------------------------
-  # 2. ODO -- One Door Orchestrator (intent routing, sampling, quality gate)
+  # 2. ODO -- One Door Orchestrator
+  #    Intent classification → pipeline routing → Engram injection →
+  #    DVTS verification → search augmentation (CRAG) → quality gate
   # ---------------------------------------------------------------------------
   odo:
     build:
@@ -80,8 +92,17 @@ services:
       ODO_PORT: "8084"
       SOUL_DIR: /data/soul
       CHIMERE_HOME: /data
+      # Search augmentation (CRAG pipeline)
       SEARXNG_URL: http://searxng:8080
       CHROMADB_URL: http://chromadb:8000
+      SEARCH_CACHE_DIR: /data/search-cache
+      # DVTS (Diverse Verifier Tree Search)
+      DVTS_ENABLED: ${DVTS_ENABLED:-true}
+      DVTS_CANDIDATES: ${DVTS_CANDIDATES:-4}
+      DVTS_SCORER_URL: http://scorer:8085
+      # Engram
+      ENGRAM_DIR: /data/engram
+      ENGRAM_ALPHA: ${ENGRAM_ALPHA:-0.3}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8084/health"]
       interval: 15s
@@ -92,9 +113,39 @@ services:
       - chimere-engram:/data/engram
       - chimere-logs:/data/logs
       - chimere-soul:/data/soul
+      - chimere-search-cache:/data/search-cache
     depends_on:
       chimere:
         condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - chimere-net
+
+  # ---------------------------------------------------------------------------
+  # 2b. Scorer -- Small model for DVTS verification + nightly evaluation
+  #     Runs on CPU, always available alongside the main GPU model.
+  #     Used by DVTS (step-level scoring) and nightly (response quality).
+  # ---------------------------------------------------------------------------
+  scorer:
+    build:
+      context: ..
+      dockerfile: docker/inference/Dockerfile
+    environment:
+      CHIMERE_MODEL: /models/${SCORER_MODEL:-scorer.gguf}
+      CHIMERE_TOKENIZER: /models/tokenizer.json
+      CHIMERE_PORT: "8085"
+      CHIMERE_LLAMA_BACKEND: "1"
+      CHIMERE_KV_MAX_SEQ: "4096"
+      CHIMERE_NCMOE: "0"
+      CHIMERE_THREADS: "6"
+    volumes:
+      - chimere-models:/models
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8085/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 120s
+      retries: 3
     restart: unless-stopped
     networks:
       - chimere-net
@@ -145,7 +196,14 @@ services:
       - chimere-net
 
   # ---------------------------------------------------------------------------
-  # 5. Nightly -- Self-improvement (LoRA, Engram, DSPy) on a daily schedule
+  # 5. Nightly -- Self-improvement pipeline (runs daily at NIGHTLY_SCHEDULE)
+  #
+  #    Phase 1: Score all responses from the day (scorer on CPU)
+  #    Phase 2: Engram update (MDL-gated, adds entries when prediction error high)
+  #    Phase 3: LoRA fine-tune on high-quality pairs (GPU swap with chimere)
+  #    Phase 4: GRPO training with verifiable rewards (tool-call accuracy, etc.)
+  #    Phase 5: DSPy prompt optimization (optional)
+  #    Phase 6: MeZO zeroth-order LoRA (no gradients needed, optional)
   # ---------------------------------------------------------------------------
   nightly:
     build:
@@ -160,18 +218,30 @@ services:
               capabilities: [gpu]
     environment:
       NIGHTLY_SCHEDULE: ${NIGHTLY_SCHEDULE:-00:30}
-      NIGHTLY_LORA: ${NIGHTLY_LORA:-true}
+      # Self-improvement modules
       NIGHTLY_ENGRAM: ${NIGHTLY_ENGRAM:-true}
+      NIGHTLY_LORA: ${NIGHTLY_LORA:-true}
+      NIGHTLY_GRPO: ${NIGHTLY_GRPO:-false}
       NIGHTLY_DSPY: ${NIGHTLY_DSPY:-false}
       NIGHTLY_MEZO: ${NIGHTLY_MEZO:-false}
+      # Connections
       ODO_BACKEND: http://chimere:8081
+      SCORER_URL: http://scorer:8085
+      CHROMADB_URL: http://chromadb:8000
       CHIMERE_HOME: /data
+      # GRPO config
+      GRPO_CANDIDATES: ${GRPO_CANDIDATES:-4}
+      GRPO_EPOCHS: ${GRPO_EPOCHS:-1}
     volumes:
       - chimere-logs:/data/logs
       - chimere-engram:/data/engram
       - chimere-soul:/data/soul
+      - chimere-training:/data/training
+      - chimere-models:/models
     depends_on:
       chimere:
+        condition: service_healthy
+      scorer:
         condition: service_healthy
     restart: unless-stopped
     networks:
