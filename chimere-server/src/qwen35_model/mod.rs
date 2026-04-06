@@ -2586,6 +2586,112 @@ impl Qwen35Model {
 }
 
 // ---------------------------------------------------------------------------
+// ChimereModel trait impl (Step 1 of multi-arch refactor)
+// ---------------------------------------------------------------------------
+//
+// This block makes Qwen35Model satisfy the model-agnostic `ChimereModel` trait
+// by delegating every method to the existing inherent implementations above.
+// **Zero behavioral change**: callers that hold a `&Qwen35Model` are unaffected,
+// and at this step nothing in the codebase invokes the trait yet — it just has
+// to compile cleanly. Steps 2-5 of the refactor migrate `generate.rs`,
+// `mtp_scheduler.rs`, `block_generate.rs` and `server.rs` to call through the
+// trait. Capability flags here advertise everything Qwen3.5 supports today
+// (MTP, block diffusion, DART, entropy routing).
+
+impl crate::chimere_model::ChimereModel for Qwen35Model {
+    fn arch(&self) -> crate::chimere_model::ModelArch {
+        crate::chimere_model::ModelArch::Qwen35A3B
+    }
+
+    fn num_layers(&self) -> usize {
+        // Forward to the existing inherent method (defined above in this impl).
+        Qwen35Model::num_layers(self)
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.config.vocab_size
+    }
+
+    fn supports_mtp(&self) -> bool {
+        // Mirrors the existing `has_mtp()` accessor.
+        self.has_mtp()
+    }
+
+    fn supports_block_diffusion(&self) -> bool {
+        true
+    }
+
+    fn supports_dart(&self) -> bool {
+        // DART verification only works when the libllama FFI backend owns the
+        // forward pass (it provides the multi-token decode primitive).
+        self.has_mtp()
+    }
+
+    fn supports_entropy_routing(&self) -> bool {
+        true
+    }
+
+    fn forward_token(
+        &self,
+        token: u32,
+        state: &mut crate::chimere_model::InferenceState<'_>,
+    ) -> candle_core::Result<crate::chimere_model::ForwardOutput> {
+        let gdn = state.as_gdn_mut()?;
+        let (logits, mtp_logits) = Qwen35Model::forward_token(self, token, gdn)?;
+        Ok(crate::chimere_model::ForwardOutput { logits, mtp_logits })
+    }
+
+    fn forward_prefill(
+        &self,
+        tokens: &[u32],
+        state: &mut crate::chimere_model::InferenceState<'_>,
+    ) -> candle_core::Result<crate::chimere_model::ForwardOutput> {
+        let gdn = state.as_gdn_mut()?;
+        let logits = Qwen35Model::forward_prefill(self, tokens, gdn)?;
+        Ok(crate::chimere_model::ForwardOutput {
+            logits,
+            mtp_logits: None,
+        })
+    }
+
+    fn reset_for_new_request(&self) {
+        // Mirrors the order used today by `server.rs::run_inference`: libllama
+        // first (no-op if FFI backend not active), then cudarc (no-op if cudarc
+        // backend not active). Only one of the two is ever live in production.
+        self.reset_llama_state();
+        self.reset_cudarc_state();
+    }
+
+    // -- libllama FFI hooks: forward to existing inherent methods ---------
+
+    fn llama_forward_active(&self) -> bool {
+        Qwen35Model::llama_forward_active(self)
+    }
+
+    fn llama_forward_mut(
+        &self,
+    ) -> Option<std::cell::RefMut<'_, Option<crate::llama_backend::LlamaForward>>> {
+        Some(Qwen35Model::llama_forward_mut(self))
+    }
+
+    fn llama_set_logit_bias(&self, token_id: u32, bias: f32) {
+        Qwen35Model::llama_set_logit_bias(self, token_id, bias);
+    }
+
+    fn llama_set_engram_bias(&self, predictions: &[(u32, f32)]) {
+        Qwen35Model::llama_set_engram_bias(self, predictions);
+    }
+
+    fn llama_clear_engram_bias(&self) {
+        Qwen35Model::llama_clear_engram_bias(self);
+    }
+
+    fn take_last_packed_logprobs(&self) -> Option<Vec<f32>> {
+        Qwen35Model::take_last_packed_logprobs(self)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

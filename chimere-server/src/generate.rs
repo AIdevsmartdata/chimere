@@ -16,9 +16,9 @@
 
 use tokenizers::Tokenizer;
 
+use crate::chimere_model::{forward_prefill_gdn, ChimereModel, ForwardOutput};
 use crate::engram_lookup::{EngramLookup, MultiEngramLookup};
 use crate::mtp_scheduler::{generate_with_mtp, generate_with_mtp_engram, MtpStats, SamplingParams};
-use crate::qwen35_model::Qwen35Model;
 use crate::state::GdnRecurrentState;
 
 /// Default tokenizer path (relative to $HOME).
@@ -100,7 +100,7 @@ pub struct GenerateResult {
 /// - `temperature`: Sampling temperature (0.0 = greedy/argmax).
 /// - `state`: Mutable model state (will be modified in place).
 pub fn generate_text(
-    model: &Qwen35Model,
+    model: &dyn ChimereModel,
     tokenizer: &Tokenizer,
     prompt: &str,
     max_tokens: usize,
@@ -120,9 +120,9 @@ pub fn generate_text(
     // 2. Process prompt tokens via batch prefill (all tokens in one pass).
     //    forward_prefill returns logits for the LAST prompt token.
     let prompt_start = std::time::Instant::now();
-    let prefill_logits = model
-        .forward_prefill(prompt_ids, state)
-        .map_err(|e| format!("Prefill failed: {}", e))?;
+    let ForwardOutput { logits: prefill_logits, mtp_logits: _ } =
+        forward_prefill_gdn(model, prompt_ids, state)
+            .map_err(|e| format!("Prefill failed: {}", e))?;
     let prompt_time = prompt_start.elapsed();
 
     // 3. Sample first generated token from prefill logits.
@@ -239,7 +239,7 @@ impl EngramConfig {
 /// - `state`: Mutable model state (will be modified in place).
 /// - `cfg`: Engram configuration (from `EngramConfig::from_env()` or constructed directly).
 pub fn generate_text_with_engram(
-    model: &Qwen35Model,
+    model: &dyn ChimereModel,
     tokenizer: &Tokenizer,
     prompt: &str,
     max_tokens: usize,
@@ -259,8 +259,7 @@ pub fn generate_text_with_engram(
 
     // 2. Process prompt tokens via batch prefill
     let prompt_start = std::time::Instant::now();
-    model
-        .forward_prefill(prompt_ids, state)
+    let _ = forward_prefill_gdn(model, prompt_ids, state)
         .map_err(|e| format!("Prefill failed: {}", e))?;
     let prompt_time = prompt_start.elapsed();
 
@@ -333,7 +332,7 @@ pub fn format_chat_prompt_with_system(system: &str, user_message: &str) -> Strin
 ///
 /// Equivalent to `generate_text` but with automatic chat formatting.
 pub fn generate_chat(
-    model: &Qwen35Model,
+    model: &dyn ChimereModel,
     tokenizer: &Tokenizer,
     user_message: &str,
     max_tokens: usize,
@@ -354,7 +353,7 @@ pub fn generate_chat(
 /// CHIMERE_ENGRAM_FILE=/path/to/table.bin CHIMERE_ENGRAM_ALPHA=0.5 ./chimere-server
 /// ```
 pub fn generate_chat_with_engram(
-    model: &Qwen35Model,
+    model: &dyn ChimereModel,
     tokenizer: &Tokenizer,
     user_message: &str,
     max_tokens: usize,

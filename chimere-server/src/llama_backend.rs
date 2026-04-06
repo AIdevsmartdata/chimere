@@ -97,6 +97,17 @@ pub struct LlamaModelTensorBuftOverride {
     pub buft: *mut GgmlBackendBufferType,
 }
 
+/// Mirrors `struct llama_chat_message` from llama.h (line 523-526).
+///
+/// Used by `llama_chat_apply_template()` to format conversation history with
+/// the model's built-in chat template (jinja-equivalent C++ engine). Both
+/// pointers must outlive the call — pass slices into stable `CString` storage.
+#[repr(C)]
+pub struct LlamaChatMessage {
+    pub role: *const c_char,
+    pub content: *const c_char,
+}
+
 /// Progress callback type.
 type LlamaProgressCallback = Option<extern "C" fn(f32, *mut c_void) -> bool>;
 
@@ -280,6 +291,48 @@ extern "C" {
     fn llama_model_get_vocab(model: *const LlamaModel) -> *const LlamaVocab;
     fn llama_vocab_n_tokens(vocab: *const LlamaVocab) -> i32;
     fn llama_n_vocab(model: *const LlamaModel) -> i32;
+    fn llama_n_layer(model: *const LlamaModel) -> i32;
+
+    // -- Tokenizer / chat template (Step 6 of multi-arch refactor) --------
+    //
+    // These are needed by `GenericModel` (Step 7) which has no Rust-side
+    // tokenizer.json file: it loads the tokenizer + chat template directly
+    // from the GGUF metadata via libllama. Qwen35Model still uses
+    // tokenizers::Tokenizer with a separate JSON, so these declarations are
+    // additive — no existing code path consumes them yet.
+
+    fn llama_tokenize(
+        model: *const LlamaModel,
+        text: *const c_char,
+        text_len: i32,
+        tokens: *mut i32,           // llama_token*
+        n_tokens_max: i32,
+        add_special: bool,
+        parse_special: bool,
+    ) -> i32;
+
+    fn llama_token_to_piece(
+        model: *const LlamaModel,
+        token: i32,                 // llama_token
+        buf: *mut c_char,
+        length: i32,
+        lstrip: i32,
+        special: bool,
+    ) -> i32;
+
+    fn llama_model_chat_template(
+        model: *const LlamaModel,
+        name: *const c_char,        // null = default template
+    ) -> *const c_char;
+
+    fn llama_chat_apply_template(
+        tmpl: *const c_char,        // null = use model default
+        chat: *const LlamaChatMessage,
+        n_msg: usize,
+        add_ass: bool,
+        buf: *mut c_char,
+        length: i32,
+    ) -> i32;
 
     fn llama_get_timings(ctx: *mut LlamaContext) -> LlamaTimings;
     fn llama_print_timings(ctx: *mut LlamaContext);
@@ -966,6 +1019,237 @@ impl LlamaForward {
     /// Rollback position counter by n tokens.
     pub fn rollback_pos(&mut self, n: i32) {
         self.pos -= n;
+    }
+
+    /// Number of main transformer/SSM layers in the loaded model. Equivalent
+    /// to the GGUF metadata field `<arch>.block_count`. Used by `GenericModel`
+    /// to satisfy `ChimereModel::num_layers`.
+    pub fn n_layer(&self) -> usize {
+        unsafe { llama_n_layer(self.model) as usize }
+    }
+
+    // ----------------------------------------------------------------------
+    // Tokenizer / chat template helpers (Step 6 of multi-arch refactor)
+    // ----------------------------------------------------------------------
+    //
+    // These wrappers expose libllama's GGUF-embedded tokenizer + chat template
+    // engine to the Rust side. They are needed by `GenericModel` (Step 7) for
+    // architectures that don't ship with a separate `tokenizer.json` file
+    // (Mamba, Nemotron-h, etc.). `Qwen35Model` keeps using `tokenizers::Tokenizer`
+    // with its own JSON for backward compatibility — these helpers do not
+    // alter any existing code path.
+
+    /// Tokenize a UTF-8 string into a vector of token IDs using the model's
+    /// own GGUF-embedded tokenizer.
+    ///
+    /// * `add_special` — prepend BOS / append EOS if the model is configured
+    ///   to do so (typically `true` at the start of a request).
+    /// * `parse_special` — interpret control tokens like `<|im_start|>` rather
+    ///   than treating them as plain text (typically `true` for chat).
+    pub fn tokenize(
+        &self,
+        text: &str,
+        add_special: bool,
+        parse_special: bool,
+    ) -> Result<Vec<i32>, String> {
+        // First call: pass a zero-sized buffer to ask libllama how many tokens
+        // we need. Negative return = -required_count.
+        let text_bytes = text.as_bytes();
+        let text_len = text_bytes.len() as i32;
+        let probe = unsafe {
+            llama_tokenize(
+                self.model,
+                text_bytes.as_ptr() as *const c_char,
+                text_len,
+                std::ptr::null_mut(),
+                0,
+                add_special,
+                parse_special,
+            )
+        };
+        if probe == 0 {
+            return Ok(Vec::new());
+        }
+        let needed = probe.unsigned_abs() as usize;
+        let mut buf = vec![0i32; needed];
+        let written = unsafe {
+            llama_tokenize(
+                self.model,
+                text_bytes.as_ptr() as *const c_char,
+                text_len,
+                buf.as_mut_ptr(),
+                needed as i32,
+                add_special,
+                parse_special,
+            )
+        };
+        if written < 0 {
+            return Err(format!(
+                "llama_tokenize failed: returned {written}, needed {needed}"
+            ));
+        }
+        buf.truncate(written as usize);
+        Ok(buf)
+    }
+
+    /// Detokenize a single token ID to its UTF-8 piece.
+    ///
+    /// * `special` — render control tokens (`<|im_start|>` etc.) verbatim if
+    ///   `true`, otherwise hide them.
+    pub fn token_to_piece(&self, token: i32, special: bool) -> Result<String, String> {
+        // 64 bytes covers >99% of pieces; for the rare big ones we re-call.
+        let mut buf = vec![0u8; 64];
+        let written = unsafe {
+            llama_token_to_piece(
+                self.model,
+                token,
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len() as i32,
+                0,
+                special,
+            )
+        };
+        let n = if written < 0 {
+            // Buffer too small; libllama returned -required_size.
+            let needed = written.unsigned_abs() as usize;
+            buf = vec![0u8; needed];
+            let written2 = unsafe {
+                llama_token_to_piece(
+                    self.model,
+                    token,
+                    buf.as_mut_ptr() as *mut c_char,
+                    buf.len() as i32,
+                    0,
+                    special,
+                )
+            };
+            if written2 < 0 {
+                return Err(format!(
+                    "llama_token_to_piece failed twice for token {token}: {written2}"
+                ));
+            }
+            written2 as usize
+        } else {
+            written as usize
+        };
+        buf.truncate(n);
+        String::from_utf8(buf).map_err(|e| format!("token_to_piece: invalid UTF-8: {e}"))
+    }
+
+    /// Detokenize a slice of token IDs by concatenating their pieces.
+    ///
+    /// Note: this is a per-token loop (cheap for short outputs). For very
+    /// large detokenize batches, prefer the streaming token-by-token decode.
+    pub fn detokenize(&self, tokens: &[i32], special: bool) -> Result<String, String> {
+        let mut out = String::with_capacity(tokens.len() * 4);
+        for &t in tokens {
+            out.push_str(&self.token_to_piece(t, special)?);
+        }
+        Ok(out)
+    }
+
+    /// Borrow the GGUF-embedded chat template (Jinja-equivalent string), or
+    /// `None` if the model does not ship one. Pass `name = None` to get the
+    /// default template.
+    pub fn chat_template(&self, name: Option<&str>) -> Option<String> {
+        let cname: Option<CString> = name.map(|n| CString::new(n).ok()).flatten();
+        let cname_ptr: *const c_char = cname
+            .as_ref()
+            .map(|s| s.as_ptr())
+            .unwrap_or(std::ptr::null());
+        let raw = unsafe { llama_model_chat_template(self.model, cname_ptr) };
+        if raw.is_null() {
+            return None;
+        }
+        // Safety: libllama returns a pointer to a static string inside the
+        // model's metadata; valid for the lifetime of the model.
+        let cstr = unsafe { std::ffi::CStr::from_ptr(raw) };
+        cstr.to_str().ok().map(|s| s.to_owned())
+    }
+
+    /// Apply the chat template (built-in C++ engine, NOT jinja) to a list of
+    /// `(role, content)` pairs and return the formatted prompt string.
+    ///
+    /// `tmpl` is the template name to use, or `None` to use the model's
+    /// default. `add_assistant_prefix = true` appends the assistant prefix
+    /// token sequence (typically `<|im_start|>assistant\n`).
+    ///
+    /// Note: this engine supports a fixed list of templates (chatml, llama3,
+    /// gemma, mistral, etc.). For arbitrary jinja, use a Rust-side renderer.
+    pub fn apply_chat_template(
+        &self,
+        tmpl: Option<&str>,
+        messages: &[(&str, &str)],
+        add_assistant_prefix: bool,
+    ) -> Result<String, String> {
+        // Hold backing CStrings for the lifetime of the FFI call.
+        let mut backing: Vec<(CString, CString)> = Vec::with_capacity(messages.len());
+        for (role, content) in messages {
+            let r = CString::new(*role)
+                .map_err(|_| "chat role contains interior NUL".to_string())?;
+            let c = CString::new(*content)
+                .map_err(|_| "chat content contains interior NUL".to_string())?;
+            backing.push((r, c));
+        }
+        let chat: Vec<LlamaChatMessage> = backing
+            .iter()
+            .map(|(r, c)| LlamaChatMessage {
+                role: r.as_ptr(),
+                content: c.as_ptr(),
+            })
+            .collect();
+        let tmpl_c: Option<CString> = tmpl.map(|t| CString::new(t).ok()).flatten();
+        let tmpl_ptr: *const c_char = tmpl_c
+            .as_ref()
+            .map(|s| s.as_ptr())
+            .unwrap_or(std::ptr::null());
+
+        // Estimate size: 2× total message length, minimum 256 bytes.
+        let estimate: usize = backing
+            .iter()
+            .map(|(r, c)| r.as_bytes().len() + c.as_bytes().len())
+            .sum::<usize>()
+            .saturating_mul(2)
+            .max(256);
+        let mut buf = vec![0u8; estimate];
+        let written = unsafe {
+            llama_chat_apply_template(
+                tmpl_ptr,
+                chat.as_ptr(),
+                chat.len(),
+                add_assistant_prefix,
+                buf.as_mut_ptr() as *mut c_char,
+                buf.len() as i32,
+            )
+        };
+        let n = if written < 0 {
+            return Err(format!(
+                "llama_chat_apply_template failed: {written} (likely unsupported template)"
+            ));
+        } else if (written as usize) > buf.len() {
+            // Buffer too small — re-call with the exact size.
+            buf = vec![0u8; written as usize];
+            let written2 = unsafe {
+                llama_chat_apply_template(
+                    tmpl_ptr,
+                    chat.as_ptr(),
+                    chat.len(),
+                    add_assistant_prefix,
+                    buf.as_mut_ptr() as *mut c_char,
+                    buf.len() as i32,
+                )
+            };
+            if written2 < 0 || (written2 as usize) > buf.len() {
+                return Err(format!(
+                    "llama_chat_apply_template failed on retry: {written2}"
+                ));
+            }
+            written2 as usize
+        } else {
+            written as usize
+        };
+        buf.truncate(n);
+        String::from_utf8(buf).map_err(|e| format!("chat template: invalid UTF-8: {e}"))
     }
 }
 

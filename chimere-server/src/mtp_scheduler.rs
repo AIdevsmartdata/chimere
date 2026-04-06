@@ -14,6 +14,8 @@
 
 use candle_core::{Result, Tensor};
 
+use crate::chimere_model::{forward_token_gdn, ChimereModel, ForwardOutput};
+
 // ---------------------------------------------------------------------------
 // NEST-style per-token adaptive Engram gating
 // ---------------------------------------------------------------------------
@@ -496,7 +498,7 @@ pub fn sample_with_temperature(logits: &Tensor, temperature: f64) -> Result<u32>
 /// - `recent_window`: Number of most recent tokens to use as engram context
 ///                    (must be >= engram order; typically `engram.order()`).
 pub fn generate_with_mtp_engram(
-    model: &crate::qwen35_model::Qwen35Model,
+    model: &dyn ChimereModel,
     prompt_token: u32,
     max_tokens: usize,
     state: &mut crate::state::GdnRecurrentState,
@@ -522,7 +524,8 @@ pub fn generate_with_mtp_engram(
     recent_context.push(prompt_token);
 
     while tokens.len() < max_tokens {
-        let (logits_tensor, _mtp) = model.forward_token(current_token, state)?;
+        let ForwardOutput { logits: logits_tensor, mtp_logits: _mtp } =
+            forward_token_gdn(model, current_token, state)?;
 
         // Engram bias: ONLY during response, NOT during thinking phase
         let sampled_token = if let Some(eng) = engram {
@@ -617,7 +620,7 @@ pub fn generate_with_mtp_engram(
 /// `[token_id, n_top, t0, lp0, t1, lp1, ..., t4, lp4]` (12 floats).
 /// When the slow sampling path is used, entries may be missing.
 pub fn generate_with_mtp(
-    model: &crate::qwen35_model::Qwen35Model,
+    model: &dyn ChimereModel,
     prompt_token: u32,
     max_tokens: usize,
     state: &mut crate::state::GdnRecurrentState,
@@ -676,7 +679,8 @@ pub fn generate_with_mtp(
             model.llama_clear_engram_bias();
         }
 
-        let (logits, _) = model.forward_token(current_token, state)?;
+        let ForwardOutput { logits, mtp_logits: _ } =
+            forward_token_gdn(model, current_token, state)?;
 
         // Fast path: if logits shape is (1,12), it's a pre-sampled token with logprobs
         // Format: [token_id, n_top, t0, lp0, t1, lp1, ..., t4, lp4]
@@ -784,7 +788,7 @@ pub fn generate_with_mtp(
 /// - Accepted tokens (main_token + drafts + correction) are in the KV cache.
 /// - Rejected draft positions have been removed via `kv_cache_seq_rm`.
 fn dart_verify_drafts(
-    model: &crate::qwen35_model::Qwen35Model,
+    model: &dyn ChimereModel,
     main_token: u32,
     draft_tokens: &[u32],
     state: &mut crate::state::GdnRecurrentState,
@@ -793,7 +797,13 @@ fn dart_verify_drafts(
         return Err(candle_core::Error::Msg("dart_verify_drafts: empty draft".into()));
     }
 
-    let mut llama_ref = model.llama_forward_mut();
+    // Trait method returns Option<RefMut<Option<LlamaForward>>>: first the
+    // outer Option flags whether the model has any libllama backend at all
+    // (None for pure-Rust models), the inner Option whether init_llama_forward
+    // has been called yet. Both must be Some for DART to run.
+    let mut llama_ref = model
+        .llama_forward_mut()
+        .ok_or_else(|| candle_core::Error::Msg("DART requires llama backend".into()))?;
     let llama = match llama_ref.as_mut() {
         Some(l) => l,
         None => return Err(candle_core::Error::Msg("DART requires llama backend".into())),
@@ -913,7 +923,7 @@ fn dart_verify_drafts(
 ///
 /// Returns MTP statistics (token IDs are delivered via the callback).
 pub fn generate_with_mtp_streaming(
-    model: &crate::qwen35_model::Qwen35Model,
+    model: &dyn ChimereModel,
     prompt_token: u32,
     max_tokens: usize,
     state: &mut crate::state::GdnRecurrentState,
@@ -982,7 +992,8 @@ pub fn generate_with_mtp_streaming(
             model.llama_clear_engram_bias();
         }
 
-        let (logits, _) = model.forward_token(current_token, state)?;
+        let ForwardOutput { logits, mtp_logits: _ } =
+            forward_token_gdn(model, current_token, state)?;
 
         // Fast path: if logits shape is (1,12), it's a pre-sampled token with logprobs
         // Format: [token_id, n_top, t0, lp0, t1, lp1, ..., t4, lp4]
