@@ -35,6 +35,10 @@ required-features = ["server"]
 name = "bench-mtp"
 path = "src/bin/bench_mtp.rs"
 
+[[bin]]
+name = "test-nemotron"
+path = "src/bin/test-nemotron.rs"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
