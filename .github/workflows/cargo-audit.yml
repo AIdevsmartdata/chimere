@@ -1,0 +1,31 @@
+name: cargo-audit (Rust)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'chimere-server/**/Cargo.toml'
+      - 'chimere-server/**/Cargo.lock'
+      - '.github/workflows/cargo-audit.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'chimere-server/**/Cargo.toml'
+      - 'chimere-server/**/Cargo.lock'
+      - '.github/workflows/cargo-audit.yml'
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly Monday 6am
+
+jobs:
+  audit:
+    name: cargo-audit
+    runs-on: [self-hosted, linux]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked || true
+      - name: Run cargo-audit
+        working-directory: chimere-server
+        run: cargo audit --color never

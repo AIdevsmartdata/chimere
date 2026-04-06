@@ -10,6 +10,7 @@ on:
 
 jobs:
   analyze:
+    name: CodeQL (Python)
     runs-on: [self-hosted, linux]
     permissions:
       security-events: write
@@ -17,6 +18,5 @@ jobs:
       - uses: actions/checkout@v4
       - uses: github/codeql-action/init@v3
         with:
-          languages: cpp, python
-      - uses: github/codeql-action/autobuild@v3
+          languages: python
       - uses: github/codeql-action/analyze@v3
