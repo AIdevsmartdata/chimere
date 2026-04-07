@@ -16,9 +16,14 @@
 
 use tokenizers::Tokenizer;
 
-use crate::chimere_model::{forward_prefill_gdn, ChimereModel, ForwardOutput};
+use crate::chimere_model::{
+    forward_prefill_gdn, forward_prefill_generic, ChimereModel, ForwardOutput,
+};
 use crate::engram_lookup::{EngramLookup, MultiEngramLookup};
-use crate::mtp_scheduler::{generate_with_mtp, generate_with_mtp_engram, MtpStats, SamplingParams};
+use crate::mtp_scheduler::{
+    generate_with_mtp, generate_with_mtp_engram, generate_with_mtp_generic, MtpStats,
+    SamplingParams,
+};
 use crate::state::GdnRecurrentState;
 
 /// Default tokenizer path (relative to $HOME).
@@ -180,6 +185,91 @@ pub fn generate_text(
         gen_time_s: gen_secs,
         tokens_per_sec: tps,
         packed_logprobs: all_packed_logprobs,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Generic-arch text generation (libllama-only path, Step 7)
+// ---------------------------------------------------------------------------
+
+/// Generate text from a raw prompt for architectures backed entirely by
+/// libllama (Mamba-1, Mamba-2, Nemotron-H MoE, ...).
+///
+/// Differences from `generate_text`:
+/// - No `GdnRecurrentState`: libllama owns all KV / SSM state internally.
+/// - No MTP / DART / Engram: those features are Qwen3.5-only.
+/// - No `</think>` detection: there is no shared reasoning format on
+///   non-Qwen archs (caller can set `CHIMERE_GENERIC_EOS` to override the
+///   stop tokens, see `generate_with_mtp_generic`).
+///
+/// The function is intentionally a *sibling* of `generate_text`, not a
+/// refactor of it: the Qwen3.5 hot path stays bit-for-bit identical.
+pub fn generate_text_generic(
+    model: &dyn ChimereModel,
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    max_tokens: usize,
+    params: &SamplingParams,
+) -> Result<GenerateResult, String> {
+    // 1. Encode prompt
+    let encoding = tokenizer
+        .encode(prompt, false)
+        .map_err(|e| format!("Tokenizer encode failed: {}", e))?;
+    let prompt_ids = encoding.get_ids();
+    if prompt_ids.is_empty() {
+        return Err("Prompt encoded to zero tokens".into());
+    }
+
+    // 2. Prefill (libllama keeps the state internally)
+    let prompt_start = std::time::Instant::now();
+    let ForwardOutput { logits: prefill_logits, mtp_logits: _ } =
+        forward_prefill_generic(model, prompt_ids)
+            .map_err(|e| format!("Prefill failed: {}", e))?;
+    let prompt_time = prompt_start.elapsed();
+
+    // 3. Sample first token from the prefill logits.
+    //    Generic models always return full [1, n_vocab] logits — no fast
+    //    sampler packed format on this path (yet).
+    let gen_start = std::time::Instant::now();
+    let first_token = if params.temperature <= 0.0 {
+        crate::mtp_scheduler::argmax(&prefill_logits)
+    } else {
+        crate::mtp_scheduler::sample_advanced(&prefill_logits, params, &[])
+    }
+    .map_err(|e| format!("First token sample failed: {}", e))?;
+
+    // 4. Generation loop (no MTP, no engram, no DART)
+    let (mut rest, stats, _logprobs) = generate_with_mtp_generic(
+        model,
+        first_token,
+        max_tokens.saturating_sub(1),
+        params,
+        Some(tokenizer),
+    )
+    .map_err(|e| format!("Generic generation failed: {}", e))?;
+    rest.insert(0, first_token);
+    let gen_time = gen_start.elapsed();
+
+    // 5. Decode
+    let text = tokenizer
+        .decode(&rest, true)
+        .map_err(|e| format!("Tokenizer decode failed: {}", e))?;
+
+    let gen_secs = gen_time.as_secs_f64();
+    let tps = if gen_secs > 0.0 {
+        rest.len() as f64 / gen_secs
+    } else {
+        0.0
+    };
+
+    Ok(GenerateResult {
+        text,
+        token_ids: rest,
+        mtp_stats: stats,
+        prompt_time_s: prompt_time.as_secs_f64(),
+        gen_time_s: gen_secs,
+        tokens_per_sec: tps,
+        packed_logprobs: vec![],
     })
 }
 
