@@ -14,7 +14,9 @@
 
 use candle_core::{Result, Tensor};
 
-use crate::chimere_model::{forward_token_gdn, ChimereModel, ForwardOutput};
+use crate::chimere_model::{
+    forward_token_gdn, forward_token_generic, ChimereModel, ForwardOutput,
+};
 
 // ---------------------------------------------------------------------------
 // NEST-style per-token adaptive Engram gating
@@ -1188,6 +1190,68 @@ pub fn generate_with_mtp_streaming(
     }
 
     Ok(stats)
+}
+
+// ---------------------------------------------------------------------------
+// Generic-arch generation (libllama-only path, Step 7)
+// ---------------------------------------------------------------------------
+//
+// Sibling of `generate_with_mtp` for architectures whose state lives
+// entirely inside the libllama FFI context (Mamba-1, Mamba-2,
+// Nemotron-H MoE, ...). Intentionally minimal: no MTP, no DART, no
+// engram, no `</think>` detection. EOS is configurable via
+// `CHIMERE_GENERIC_EOS` (comma-separated list, default `[2]`).
+
+/// Run greedy / sampled generation on a libllama-backed model.
+///
+/// Returns `(generated_token_ids, MtpStats, Vec<Vec<f32>>)`. The third
+/// field is always empty for the Generic path — packed logprobs are not
+/// produced because Generic models do not go through the C++ fast
+/// sampler. Returned for ABI parity with `generate_with_mtp`.
+pub fn generate_with_mtp_generic(
+    model: &dyn ChimereModel,
+    prompt_token: u32,
+    max_tokens: usize,
+    params: &SamplingParams,
+    _tokenizer: Option<&tokenizers::Tokenizer>,
+) -> Result<(Vec<u32>, MtpStats, Vec<Vec<f32>>)> {
+    let mut tokens: Vec<u32> = Vec::new();
+    let mut stats = MtpStats::default();
+    let logprobs: Vec<Vec<f32>> = Vec::new();
+    let mut current = prompt_token;
+
+    // EOS detection: caller can override the default per-arch via
+    // CHIMERE_GENERIC_EOS (comma-separated u32 list). Default = 2
+    // (Nemotron-H / GPT-2 `<|endoftext|>`). Mamba-1 typically uses 0.
+    let eos_tokens: Vec<u32> = std::env::var("CHIMERE_GENERIC_EOS")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|t| t.trim().parse::<u32>().ok())
+                .collect::<Vec<u32>>()
+        })
+        .unwrap_or_else(|| vec![2]);
+
+    // Push the prompt's last token immediately so the caller observes the
+    // same "first generated token = prompt_token" semantics as
+    // `generate_text_generic`. The first forward call below uses
+    // `current = prompt_token` to predict what comes after it.
+    for _ in 0..max_tokens {
+        let out = forward_token_generic(model, current)?;
+        let next = if params.temperature <= 0.0 {
+            argmax(&out.logits)?
+        } else {
+            sample_advanced(&out.logits, params, &tokens)?
+        };
+        tokens.push(next);
+        stats.tokens_generated += 1;
+        if eos_tokens.contains(&next) {
+            break;
+        }
+        current = next;
+    }
+
+    Ok((tokens, stats, logprobs))
 }
 
 #[cfg(test)]
