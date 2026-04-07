@@ -119,6 +119,12 @@ pub enum InferenceState<'a> {
     /// matrix state, conv1d sliding window, KV cache, and assorted scratch
     /// buffers). See `state::GdnRecurrentState`.
     Gdn(&'a mut GdnRecurrentState),
+    /// Opaque marker for architectures whose state lives ENTIRELY inside the
+    /// libllama FFI context (Mamba-1, Mamba-2, Nemotron-H MoE, ...). The
+    /// lifetime is carried solely to keep the enum generic over `'a` — there
+    /// is no borrowed field. Callers pass `InferenceState::Generic` whenever
+    /// they call a `ChimereModel::forward_*` method on a `GenericModel`.
+    Generic(std::marker::PhantomData<&'a ()>),
 }
 
 impl<'a> InferenceState<'a> {
@@ -127,9 +133,12 @@ impl<'a> InferenceState<'a> {
     pub fn as_gdn_mut(&mut self) -> Result<&mut GdnRecurrentState> {
         match self {
             InferenceState::Gdn(s) => Ok(*s),
-            // No `_` arm at Step 1: with only one variant the match is
-            // exhaustive. When `Generic` lands in Step 7 the compiler will
-            // require this arm to be handled, which is the desired behavior.
+            InferenceState::Generic(_) => Err(candle_core::Error::Msg(
+                "InferenceState::Generic has no GdnRecurrentState — caller \
+                 misrouted a libllama-backed model into a Qwen-only code \
+                 path"
+                    .into(),
+            )),
         }
     }
 }
@@ -296,5 +305,35 @@ pub fn forward_prefill_gdn(
     state: &mut GdnRecurrentState,
 ) -> Result<ForwardOutput> {
     let mut inf = InferenceState::Gdn(state);
+    model.forward_prefill(tokens, &mut inf)
+}
+
+// ---------------------------------------------------------------------------
+// Convenience helpers for libllama-only callers (Step 7)
+// ---------------------------------------------------------------------------
+//
+// These mirror the `*_gdn` helpers above but build a phantom
+// `InferenceState::Generic` instead. Used by the Generic generation path
+// (`generate.rs::generate_text_generic`,
+// `mtp_scheduler.rs::generate_with_mtp_generic`) so the call sites do not
+// have to know about `std::marker::PhantomData`.
+
+/// Wrap a phantom `InferenceState::Generic` and call `model.forward_token`.
+#[inline]
+pub fn forward_token_generic(
+    model: &dyn ChimereModel,
+    token: u32,
+) -> Result<ForwardOutput> {
+    let mut inf = InferenceState::Generic(std::marker::PhantomData);
+    model.forward_token(token, &mut inf)
+}
+
+/// Wrap a phantom `InferenceState::Generic` and call `model.forward_prefill`.
+#[inline]
+pub fn forward_prefill_generic(
+    model: &dyn ChimereModel,
+    tokens: &[u32],
+) -> Result<ForwardOutput> {
+    let mut inf = InferenceState::Generic(std::marker::PhantomData);
     model.forward_prefill(tokens, &mut inf)
 }
