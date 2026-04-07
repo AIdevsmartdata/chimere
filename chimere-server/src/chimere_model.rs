@@ -248,6 +248,15 @@ pub trait ChimereModel {
         None
     }
 
+    /// Immutable view of the underlying `LlamaForward` (read-only access for
+    /// tokenization, n_vocab queries, debug introspection). Returns `None`
+    /// for models without a libllama backend. Default impl returns `None`.
+    fn llama_forward(
+        &self,
+    ) -> Option<std::cell::Ref<'_, Option<LlamaForward>>> {
+        None
+    }
+
     /// Push an additive logit bias for a single token to the C++ sampler. The
     /// canonical use case is `</think>` suppression while the model is still
     /// inside its reasoning block. No-op when no libllama backend is active.

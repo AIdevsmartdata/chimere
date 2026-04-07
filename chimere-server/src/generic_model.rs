@@ -220,6 +220,12 @@ impl ChimereModel for GenericModel {
         Some(self.llama_forward.borrow_mut())
     }
 
+    fn llama_forward(
+        &self,
+    ) -> Option<std::cell::Ref<'_, Option<LlamaForward>>> {
+        Some(self.llama_forward.borrow())
+    }
+
     fn llama_set_logit_bias(&self, token_id: u32, bias: f32) {
         if let Some(llama) = self.llama_forward.borrow_mut().as_mut() {
             llama.set_logit_bias(token_id, bias);

@@ -1271,6 +1271,12 @@ impl Qwen35Model {
         self.llama_forward.borrow_mut()
     }
 
+    /// Immutable borrow of the LlamaForward RefCell. Used by the
+    /// `ChimereModel::llama_forward()` trait impl for read-only access.
+    pub fn llama_forward_borrow(&self) -> std::cell::Ref<'_, Option<crate::llama_backend::LlamaForward>> {
+        self.llama_forward.borrow()
+    }
+
     /// Take the last packed logprobs from the fast-sampler path.
     /// Returns None if the last forward_token used the slow path.
     /// Format: [token_id, n_top, t0, lp0, t1, lp1, t2, lp2, t3, lp3, t4, lp4]
@@ -2672,6 +2678,16 @@ impl crate::chimere_model::ChimereModel for Qwen35Model {
         &self,
     ) -> Option<std::cell::RefMut<'_, Option<crate::llama_backend::LlamaForward>>> {
         Some(Qwen35Model::llama_forward_mut(self))
+    }
+
+    fn llama_forward(
+        &self,
+    ) -> Option<std::cell::Ref<'_, Option<crate::llama_backend::LlamaForward>>> {
+        // The inherent `llama_forward_mut` returns the `RefMut`; we expose an
+        // immutable `Ref` here by borrowing the same RefCell directly. This
+        // matches the GenericModel impl and supports tokenizer FFI fallback
+        // and read-only debug paths.
+        Some(self.llama_forward_borrow())
     }
 
     fn llama_set_logit_bias(&self, token_id: u32, bias: f32) {
