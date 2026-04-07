@@ -38,7 +38,9 @@ use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
 use tokio::sync::Mutex;
 
-use crate::generate::generate_text;
+use crate::chimere_model::{ChimereModel, ModelArch};
+use crate::generate::{generate_text, generate_text_generic};
+use crate::generic_model::GenericModel;
 use crate::mtp_scheduler::{SamplingParams, generate_with_mtp_streaming};
 use crate::qwen35_model::Qwen35Model;
 use crate::state::GdnRecurrentState;
@@ -248,15 +250,58 @@ pub struct Delta {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-arch model wrapper (Step 7)
+// ---------------------------------------------------------------------------
+//
+// Closed enum with 2 variants — NOT a trait object. Keeps arch-specific
+// inherent methods (Qwen35Model::device, ::config, ::reset_cudarc_state,
+// ::reset_llama_state) accessible without going through the trait, while
+// letting call sites up-cast to `&dyn ChimereModel` for generation helpers.
+//
+// Both inner types are !Sync (RefCell for libllama / cudarc state). The
+// outer Mutex in AppState serialises inference — one request at a time.
+pub enum AppStateModel {
+    /// Qwen3.5-35B-A3B — full production stack (MTP, cudarc, block diffusion,
+    /// entropy routing, Candle path, Engram-aware sampling).
+    Qwen35(Qwen35Model),
+    /// libllama-native architectures (Mamba-1 / Mamba-2 / Nemotron-H MoE / ...).
+    /// No MTP, no DART, no block diffusion — forward via LlamaForward only.
+    Generic(GenericModel),
+}
+
+impl AppStateModel {
+    /// Up-cast to `&dyn ChimereModel` for calls into `generate.rs` and
+    /// `mtp_scheduler.rs` which accept the trait object.
+    pub fn as_trait(&self) -> &dyn ChimereModel {
+        match self {
+            AppStateModel::Qwen35(m) => m,
+            AppStateModel::Generic(m) => m,
+        }
+    }
+
+    pub fn arch(&self) -> ModelArch {
+        match self {
+            AppStateModel::Qwen35(m) => ChimereModel::arch(m),
+            AppStateModel::Generic(m) => ChimereModel::arch(m),
+        }
+    }
+}
+
+// !Sync inner types — manual Send is correct because the outer Mutex
+// serialises access. Same pattern as the per-type unsafe impl already
+// present on Qwen35Model and GenericModel.
+unsafe impl Send for AppStateModel {}
+
+// ---------------------------------------------------------------------------
 // Shared application state
 //
-// `Qwen35Model` contains `RefCell<Option<Tensor>>` which makes it !Sync.
-// We wrap it in `Arc<Mutex<...>>` so it can be shared across handler tasks.
-// The `Mutex` also enforces single-request inference (the model is stateful).
+// Inner model types contain `RefCell<...>` which makes them !Sync.
+// We wrap in `Arc<Mutex<...>>` so handler tasks can share the state.
+// The `Mutex` also enforces single-request inference (model is stateful).
 // ---------------------------------------------------------------------------
 
 pub struct AppState {
-    /// Model is behind a Mutex because Qwen35Model is !Sync (RefCell inside).
+    /// Model is behind a Mutex because the inner types are !Sync (RefCell).
     /// The mutex also serialises inference — one request at a time.
     pub model: Mutex<Qwen35Model>,
     pub tokenizer: Arc<Tokenizer>,
