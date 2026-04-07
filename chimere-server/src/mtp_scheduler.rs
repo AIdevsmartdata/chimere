@@ -642,7 +642,23 @@ pub fn generate_with_mtp(
 
     // Engram: O(1) hash lookup for n-gram predictions → logit biasing
     // FIXES (Mar 27 ablation): disable during thinking, reduce alpha, longer context
-    let engram_lookup = crate::engram_lookup::MultiEngramLookup::from_env();
+    // Step 7: tables are keyed on Qwen3.5 token IDs — refuse to load on any
+    // other arch (otherwise Nemotron tokens would index Qwen vocab → garbage
+    // or crash if vocab sizes differ).
+    let engram_lookup = if model.arch() == crate::chimere_model::ModelArch::Qwen35A3B {
+        crate::engram_lookup::MultiEngramLookup::from_env()
+    } else {
+        if std::env::var("CHIMERE_ENGRAM_DIR").is_ok()
+            || std::env::var("CHIMERE_ENGRAM_FILE").is_ok()
+        {
+            eprintln!(
+                "[ENGRAM] Disabled for arch {} — tokenizer mismatch with \
+                 Qwen3.5-only engram tables.",
+                model.arch().name()
+            );
+        }
+        None
+    };
     let engram_alpha: f32 = std::env::var("CHIMERE_ENGRAM_ALPHA")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(0.1); // was 0.3 — too aggressive
     if let Some(ref e) = engram_lookup {
@@ -946,7 +962,21 @@ pub fn generate_with_mtp_streaming(
     let mut thinking = thinking_from_env || prompt_token == THINK_START;
 
     // Engram: O(1) hash lookup for n-gram predictions → logit biasing
-    let engram_lookup = crate::engram_lookup::MultiEngramLookup::from_env();
+    // Step 7: gate on arch (Qwen3.5 only) — see generate_with_mtp for rationale.
+    let engram_lookup = if model.arch() == crate::chimere_model::ModelArch::Qwen35A3B {
+        crate::engram_lookup::MultiEngramLookup::from_env()
+    } else {
+        if std::env::var("CHIMERE_ENGRAM_DIR").is_ok()
+            || std::env::var("CHIMERE_ENGRAM_FILE").is_ok()
+        {
+            eprintln!(
+                "[ENGRAM] Disabled for arch {} — tokenizer mismatch with \
+                 Qwen3.5-only engram tables.",
+                model.arch().name()
+            );
+        }
+        None
+    };
     let engram_alpha: f32 = std::env::var("CHIMERE_ENGRAM_ALPHA")
         .ok().and_then(|s| s.parse().ok()).unwrap_or(0.1); // was 0.3
     if let Some(ref e) = engram_lookup {
