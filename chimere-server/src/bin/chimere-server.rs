@@ -32,11 +32,59 @@
 use std::sync::Arc;
 
 use candle_core::Device;
+use chimere_deltanet::chimere_model::ModelArch;
 use chimere_deltanet::generate::load_tokenizer;
+use chimere_deltanet::generic_model::GenericModel;
+use chimere_deltanet::gguf_loader::GgufFile;
 use chimere_deltanet::qwen35_model::Qwen35Model;
-use chimere_deltanet::server::{AppState, build_router};
+use chimere_deltanet::server::{AppState, AppStateModel, build_router};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+
+/// Detect the architecture of a GGUF file by peeking at its
+/// `general.architecture` metadata field. The mmap is opened, the
+/// metadata read, then the file is dropped — total cost is well under
+/// 100 ms for a 15 GB GGUF.
+///
+/// Tolerant matching: accepts the canonical strings emitted by current
+/// llama.cpp / ik_llama (`qwen35moe`, `mamba`, `mamba2`, `nemotron_h_moe`)
+/// plus a few common spellings observed in the wild.
+///
+/// Verified by PF-2 on 2026-04-07: chimere-v3-ramp.gguf reports
+/// `qwen35moe`, Nemotron-3-Nano-30B-A3B-Q4_0.gguf reports
+/// `nemotron_h_moe`. Both are matched below.
+fn detect_arch(model_path: &str) -> Result<ModelArch, String> {
+    let gguf = GgufFile::open(model_path)
+        .map_err(|e| format!("cannot open GGUF {}: {}", model_path, e))?;
+    let arch_str = gguf
+        .get_metadata("general.architecture")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    drop(gguf); // release mmap before the heavy load below
+    eprintln!(
+        "[chimere-server] Detected GGUF architecture: '{}'",
+        arch_str
+    );
+    let arch = match arch_str.to_ascii_lowercase().as_str() {
+        // Qwen3.5 (production). PF-2 confirmed exact spelling = "qwen35moe".
+        "qwen35" | "qwen3.5" | "qwen3_5" | "qwen35moe" | "qwen3.5moe"
+        | "qwen3next" | "qwen3.5next" => ModelArch::Qwen35A3B,
+        "mamba" | "mamba1" => ModelArch::Mamba1,
+        "mamba2" | "mamba_2" => ModelArch::Mamba2,
+        "nemotron_h_moe" | "nemotronh" | "nemotron-h" | "nemotron_h" => {
+            ModelArch::NemotronHMoe
+        }
+        other => {
+            return Err(format!(
+                "unsupported architecture '{}'. Supported: qwen3.5, mamba, \
+                 mamba2, nemotron_h_moe.",
+                other
+            ));
+        }
+    };
+    Ok(arch)
+}
 
 #[tokio::main]
 async fn main() {
