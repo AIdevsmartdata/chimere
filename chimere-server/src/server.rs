@@ -287,10 +287,16 @@ impl AppStateModel {
     }
 }
 
-// !Sync inner types — manual Send is correct because the outer Mutex
-// serialises access. Same pattern as the per-type unsafe impl already
-// present on Qwen35Model and GenericModel.
-unsafe impl Send for AppStateModel {}
+// Send is auto-derived: both variants (Qwen35Model, GenericModel) are Send.
+// The outer Mutex in AppState serialises access. No manual unsafe impl
+// needed (and it would conflict with the auto-derive).
+//
+// IMPORTANT: `&Qwen35Model` is NOT Send (Qwen35Model has RefCell fields,
+// so &Qwen35Model: Send requires Qwen35Model: Sync, which is false).
+// As a consequence, no `.await` may run while holding a typed variant
+// reference borrowed via `match &*model_guard`. See `run_inference` for
+// the pattern: all multi-agent bookkeeping awaits happen BEFORE locking
+// the model, then the inference path is sync from the lock to the drop.
 
 // ---------------------------------------------------------------------------
 // Shared application state
@@ -303,7 +309,7 @@ unsafe impl Send for AppStateModel {}
 pub struct AppState {
     /// Model is behind a Mutex because the inner types are !Sync (RefCell).
     /// The mutex also serialises inference — one request at a time.
-    pub model: Mutex<Qwen35Model>,
+    pub model: Mutex<AppStateModel>,
     pub tokenizer: Arc<Tokenizer>,
     pub model_name: String,
     /// Multi-agent context switching scheduler.
@@ -599,17 +605,21 @@ async fn run_inference(
         .map(|enc| enc.len())
         .unwrap_or(0);
 
-    // Lock the model for the duration of inference.
-    let model = state.model.lock().await;
-
-    // Multi-agent context switching: if user is specified, switch to that agent's context.
-    if let Some(user_name) = user {
-        let agent_id = {
+    // ------------------------------------------------------------------
+    // STEP 7: resolve agent_id BEFORE locking the model.
+    // The match on `&*model` later gives us `&Qwen35Model` which is NOT
+    // Send (Qwen35Model has RefCells, so &Qwen35Model: Send requires
+    // Qwen35Model: Sync, which is false). To keep the inference future
+    // Send (required by axum's Handler bound), no `.await` may run while
+    // we hold the typed variant ref. So we do all the multi-agent
+    // bookkeeping awaits first, then lock the model and dispatch sync.
+    // ------------------------------------------------------------------
+    let agent_id_opt: Option<usize> = if let Some(user_name) = user {
+        let id = {
             let mut map = state.user_agent_map.lock().await;
             if let Some(&id) = map.get(user_name) {
                 id
             } else {
-                // Auto-register new agent
                 let mut sched = state.agent_scheduler.lock().await;
                 let id = sched.register_agent(user_name);
                 map.insert(user_name.to_string(), id);
@@ -617,42 +627,92 @@ async fn run_inference(
                 id
             }
         };
-
-        // Switch to this agent's context (save current, restore target)
-        if model.llama_forward_active() {
-            let mut sched = state.agent_scheduler.lock().await;
-            let mut llama_ref = model.llama_forward_mut();
-            if let Some(llama) = llama_ref.as_mut() {
-                match sched.switch_to(agent_id, llama) {
-                    Ok(ms) => {
-                        if ms > 0.1 {
-                            eprintln!("[AGENT] Switched to '{}' (agent {}) in {:.1}ms", user_name, agent_id, ms);
-                        }
-                    }
-                    Err(e) => eprintln!("[AGENT] Context switch to '{}' failed: {}", user_name, e),
-                }
-            }
-        }
+        Some(id)
     } else {
-        // No user specified — reset state for stateless request.
-        model.reset_llama_state();
-    }
+        None
+    };
 
-    model.reset_cudarc_state();
+    // Lock the model for the duration of inference. NO MORE AWAITS BEYOND
+    // THIS POINT (until the lock is dropped at the end of the function).
+    let model = state.model.lock().await;
 
-    // Build a fresh recurrent state for this request.
-    let device = model.device.clone();
-    let mut inf_state = GdnRecurrentState::new(&model.config, &device)
-        .map_err(|e| format!("State init failed: {}", e))?;
+    // Per-arch dispatch.
+    let gen = match &*model {
+        AppStateModel::Qwen35(qwen) => {
+            // ----------------------------------------------------------
+            // EXISTING PRODUCTION PATH — same operations as the
+            // pre-Step-7 implementation, but the agent context switch
+            // now reuses the agent_id resolved above (no new awaits).
+            // ----------------------------------------------------------
+            if let Some(agent_id) = agent_id_opt {
+                if qwen.llama_forward_active() {
+                    // agent_scheduler.lock() returns a sync Mutex guard
+                    // here only because we already awaited above for the
+                    // map insertion. We use try_lock to avoid an await;
+                    // the agent scheduler is only contended during the
+                    // initial registration, which already happened.
+                    if let Ok(mut sched) = state.agent_scheduler.try_lock() {
+                        let mut llama_ref = qwen.llama_forward_mut();
+                        if let Some(llama) = llama_ref.as_mut() {
+                            match sched.switch_to(agent_id, llama) {
+                                Ok(ms) => {
+                                    if ms > 0.1 {
+                                        eprintln!("[AGENT] Switched to agent {} in {:.1}ms", agent_id, ms);
+                                    }
+                                }
+                                Err(e) => eprintln!("[AGENT] Context switch to agent {} failed: {}", agent_id, e),
+                            }
+                        }
+                    } else {
+                        eprintln!("[AGENT] Scheduler busy — skipping context switch for agent {}", agent_id);
+                    }
+                }
+            } else {
+                // No user specified — reset state for stateless request.
+                qwen.reset_llama_state();
+            }
 
-    let gen = generate_text(
-        &*model,
-        &state.tokenizer,
-        prompt,
-        max_tokens,
-        params,
-        &mut inf_state,
-    )?;
+            qwen.reset_cudarc_state();
+
+            // Build a fresh recurrent state for this request.
+            let device = qwen.device.clone();
+            let mut inf_state = GdnRecurrentState::new(&qwen.config, &device)
+                .map_err(|e| format!("State init failed: {}", e))?;
+
+            generate_text(
+                qwen,
+                &state.tokenizer,
+                prompt,
+                max_tokens,
+                params,
+                &mut inf_state,
+            )?
+        }
+        AppStateModel::Generic(gm) => {
+            // ----------------------------------------------------------
+            // NEW PATH — libllama-only. No GdnRecurrentState, no cudarc,
+            // no MTP. Multi-agent context switching is intentionally NOT
+            // wired here for Step 7 (single-agent only — see master plan
+            // question #1). The `user` field is silently ignored.
+            // ----------------------------------------------------------
+            if user.is_some() {
+                eprintln!(
+                    "[AGENT] Generic arch ({}) ignores 'user' field at Step 7 \
+                     (multi-agent deferred to Step 7.5)",
+                    ChimereModel::arch(gm).name()
+                );
+            }
+            gm.reset_for_new_request();
+
+            generate_text_generic(
+                gm,
+                &state.tokenizer,
+                prompt,
+                max_tokens,
+                params,
+            )?
+        }
+    };
 
     let completion_tokens = gen.token_ids.len();
     Ok((gen.text, prompt_tokens, completion_tokens, gen.packed_logprobs))
@@ -866,95 +926,140 @@ async fn chat_completions_stream(
         // Lock the model (blocking — we're on a dedicated OS thread).
         let model = state_clone.model.blocking_lock();
 
-        // Reset state for the active backend (llama or cudarc).
-        model.reset_llama_state();
-        model.reset_cudarc_state();
+        // Per-arch dispatch. The Qwen path is byte-for-byte identical to
+        // the pre-Step-7 implementation (only re-indented inside a match
+        // arm). The Generic path is a non-streaming wrapper — it runs
+        // generate_text_generic and emits the whole text as a single
+        // Token message followed by Done. SSE consumers see one event
+        // with the full content; this matches OpenAI behaviour for
+        // models that do not stream natively. Replacing this with a
+        // proper token-by-token Generic streaming loop is a Step 7.5
+        // ticket.
+        match &*model {
+            AppStateModel::Qwen35(qwen) => {
+                // Reset state for the active backend (llama or cudarc).
+                qwen.reset_llama_state();
+                qwen.reset_cudarc_state();
 
-        // Build a fresh recurrent state for this request.
-        let device = model.device.clone();
-        let mut inf_state = match GdnRecurrentState::new(&model.config, &device) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = tx.blocking_send(StreamMsg::Done(Some(format!("State init failed: {}", e))));
-                return;
+                // Build a fresh recurrent state for this request.
+                let device = qwen.device.clone();
+                let mut inf_state = match GdnRecurrentState::new(&qwen.config, &device) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = tx.blocking_send(StreamMsg::Done(Some(format!("State init failed: {}", e))));
+                        return;
+                    }
+                };
+
+                // Prefill prompt tokens and sample first token.
+                let prefill_logits = match qwen.forward_prefill(&prompt_ids, &mut inf_state) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        let _ = tx.blocking_send(StreamMsg::Done(Some(format!("Prefill failed: {}", e))));
+                        return;
+                    }
+                };
+
+                // Extract first sampled token from prefill logits
+                let dims = prefill_logits.dims();
+                let last_tok = if dims.len() == 2 && dims[1] == 12 {
+                    // C++ fast path: token already sampled (packed format)
+                    prefill_logits.flatten_all().unwrap().to_vec1::<f32>().unwrap()[0] as u32
+                } else {
+                    // Slow path: argmax from full logits
+                    crate::mtp_scheduler::argmax(&prefill_logits).unwrap_or(0)
+                };
+
+                // Streaming generation with per-token callback.
+                let tx_ref = &tx;
+                let tok_ref = &*tokenizer_clone;
+                let model_ref: &dyn ChimereModel = qwen;
+
+                // Signal thinking mode to the scheduler via env var (thread-local safe
+                // because we're on a dedicated OS thread per request).
+                if enable_thinking {
+                    std::env::set_var("CHIMERE_THINKING_ACTIVE", "1");
+                } else {
+                    std::env::remove_var("CHIMERE_THINKING_ACTIVE");
+                }
+
+                let result = generate_with_mtp_streaming(
+                    model_ref,
+                    last_tok,
+                    max_tokens,
+                    &mut inf_state,
+                    &params,
+                    Some(tok_ref),
+                    &mut |_token_id: u32, decoded_text: &str, is_thinking: bool| -> bool {
+                        // Drain logprobs (avoids stale data). Only build content if requested.
+                        let logprob_content = if want_logprobs {
+                            model_ref.take_last_packed_logprobs()
+                                .map(|packed| packed_to_logprob_content(&packed, tok_ref, top_logprobs_n))
+                        } else {
+                            // Still drain to avoid stale data, but discard.
+                            let _ = model_ref.take_last_packed_logprobs();
+                            None
+                        };
+
+                        // Skip empty decoded text (incomplete multi-byte sequence).
+                        if decoded_text.is_empty() {
+                            return true;
+                        }
+
+                        // Route thinking tokens to reasoning_content, content tokens to content.
+                        let msg = if is_thinking {
+                            StreamMsg::Thinking(decoded_text.to_string())
+                        } else {
+                            StreamMsg::Token(decoded_text.to_string(), logprob_content)
+                        };
+
+                        match tx_ref.blocking_send(msg) {
+                            Ok(()) => true,
+                            Err(_) => false, // Channel closed — client disconnected.
+                        }
+                    },
+                );
+
+                // Send completion message.
+                let err_msg = match result {
+                    Ok(_stats) => None,
+                    Err(e) => Some(format!("Generation error: {}", e)),
+                };
+                let _ = tx.blocking_send(StreamMsg::Done(err_msg));
             }
-        };
-
-        // Prefill prompt tokens and sample first token.
-        let prefill_logits = match model.forward_prefill(&prompt_ids, &mut inf_state) {
-            Ok(l) => l,
-            Err(e) => {
-                let _ = tx.blocking_send(StreamMsg::Done(Some(format!("Prefill failed: {}", e))));
-                return;
+            AppStateModel::Generic(gm) => {
+                // Generic arch streaming = non-streaming wrapper for now.
+                // We rebuild the prompt string from the already-encoded
+                // ids by re-decoding them, then call generate_text_generic
+                // and emit a single Token message with the whole result.
+                gm.reset_for_new_request();
+                let prompt_text = match tokenizer_clone.decode(&prompt_ids, true) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let _ = tx.blocking_send(StreamMsg::Done(Some(format!("Tokenizer decode failed: {}", e))));
+                        return;
+                    }
+                };
+                let result = generate_text_generic(
+                    gm,
+                    &*tokenizer_clone,
+                    &prompt_text,
+                    max_tokens,
+                    &params,
+                );
+                match result {
+                    Ok(gen) => {
+                        if !gen.text.is_empty() {
+                            let _ = tx.blocking_send(StreamMsg::Token(gen.text, None));
+                        }
+                        let _ = tx.blocking_send(StreamMsg::Done(None));
+                    }
+                    Err(e) => {
+                        let _ = tx.blocking_send(StreamMsg::Done(Some(format!("Generic generation error: {}", e))));
+                    }
+                }
             }
-        };
-
-        // Extract first sampled token from prefill logits
-        let dims = prefill_logits.dims();
-        let last_tok = if dims.len() == 2 && dims[1] == 12 {
-            // C++ fast path: token already sampled (packed format)
-            prefill_logits.flatten_all().unwrap().to_vec1::<f32>().unwrap()[0] as u32
-        } else {
-            // Slow path: argmax from full logits
-            crate::mtp_scheduler::argmax(&prefill_logits).unwrap_or(0)
-        };
-
-        // Streaming generation with per-token callback.
-        let tx_ref = &tx;
-        let tok_ref = &*tokenizer_clone;
-        let model_ref = &*model; // shared ref for logprobs access in callback
-
-        // Signal thinking mode to the scheduler via env var (thread-local safe
-        // because we're on a dedicated OS thread per request).
-        if enable_thinking {
-            std::env::set_var("CHIMERE_THINKING_ACTIVE", "1");
-        } else {
-            std::env::remove_var("CHIMERE_THINKING_ACTIVE");
         }
-
-        let result = generate_with_mtp_streaming(
-            model_ref,
-            last_tok,
-            max_tokens,
-            &mut inf_state,
-            &params,
-            Some(tok_ref),
-            &mut |_token_id: u32, decoded_text: &str, is_thinking: bool| -> bool {
-                // Drain logprobs (avoids stale data). Only build content if requested.
-                let logprob_content = if want_logprobs {
-                    model_ref.take_last_packed_logprobs()
-                        .map(|packed| packed_to_logprob_content(&packed, tok_ref, top_logprobs_n))
-                } else {
-                    // Still drain to avoid stale data, but discard.
-                    let _ = model_ref.take_last_packed_logprobs();
-                    None
-                };
-
-                // Skip empty decoded text (incomplete multi-byte sequence).
-                if decoded_text.is_empty() {
-                    return true;
-                }
-
-                // Route thinking tokens to reasoning_content, content tokens to content.
-                let msg = if is_thinking {
-                    StreamMsg::Thinking(decoded_text.to_string())
-                } else {
-                    StreamMsg::Token(decoded_text.to_string(), logprob_content)
-                };
-
-                match tx_ref.blocking_send(msg) {
-                    Ok(()) => true,
-                    Err(_) => false, // Channel closed — client disconnected.
-                }
-            },
-        );
-
-        // Send completion message.
-        let err_msg = match result {
-            Ok(_stats) => None,
-            Err(e) => Some(format!("Generation error: {}", e)),
-        };
-        let _ = tx.blocking_send(StreamMsg::Done(err_msg));
         // tx is dropped here, closing the channel.
     });
 
