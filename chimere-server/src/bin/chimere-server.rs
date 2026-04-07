@@ -147,73 +147,145 @@ async fn main() {
     };
 
     // -----------------------------------------------------------------
-    // Load model — three paths, ordered by performance:
-    //
-    // 1. CHIMERE_LLAMA_BACKEND=1 (recommended, 93 tok/s):
-    //    Create a lightweight shell (config + MRoPE only, ~0 Candle VRAM).
-    //    init_llama_forward() loads the model via libllama.so (~14.7 GB).
-    //    The entire forward pass is delegated to ik_llama's CUDA kernels.
-    //
-    // 2. CHIMERE_CUDARC_FORWARD=1 (~39 tok/s):
-    //    Shell + cudarc raw weights from GGUF.
-    //
-    // 3. Default: Full Candle path via from_gguf().
+    // Step 7: detect architecture from GGUF metadata, dispatch to the
+    // correct loader (Qwen35Model for the prod path, GenericModel for
+    // libllama-only archs like Mamba-2 / Nemotron-H MoE).
     // -----------------------------------------------------------------
-    let model = if llama_backend {
-        eprintln!("[chimere-server] LLAMA_BACKEND mode: loading via libllama.so (93 tok/s)...");
-        // Create a lightweight shell — only config + MRoPE, zero Candle weight VRAM.
-        // libllama loads weights independently via its own CUDA backend.
-        let shell = match Qwen35Model::cudarc_shell(&model_path, &device) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("[chimere-server] Fatal: shell creation failed: {}", e);
-                std::process::exit(1);
-            }
-        };
-
-        // Initialize libllama FFI — loads GGUF and creates context.
-        if let Err(e) = shell.init_llama_forward() {
-            eprintln!("[chimere-server] Fatal: llama_backend init failed: {}", e);
+    let arch = match detect_arch(&model_path) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("[chimere-server] Fatal: {}", e);
             std::process::exit(1);
         }
-        eprintln!("[chimere-server] libllama backend ready.");
-        shell
-    } else if cudarc_forward {
-        eprintln!("[chimere-server] CUDARC mode: loading lightweight shell (no Candle weights)...");
-        let shell = match Qwen35Model::cudarc_shell(&model_path, &device) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("[chimere-server] Fatal: cudarc shell creation failed: {}", e);
-                std::process::exit(1);
-            }
-        };
+    };
 
-        // Load cudarc weights from GGUF — this is the ONLY GPU weight load.
-        eprintln!("[chimere-server] Loading cudarc weights from {} ...", model_path);
-        if let Err(e) = shell.init_cudarc_forward() {
-            eprintln!("[chimere-server] Fatal: cudarc forward init failed: {}", e);
-            std::process::exit(1);
-        }
-        eprintln!("[chimere-server] Cudarc model ready (single load, ~14.7 GB VRAM).");
-        shell
-    } else {
-        // Legacy Candle path: load full model with QMatMul weights.
-        eprintln!("[chimere-server] Loading model from {} ...", model_path);
-        let m = match Qwen35Model::from_gguf(&model_path, &device, None) {
-            Ok(m) => {
-                eprintln!("[chimere-server] Model loaded (Candle path).");
+    // Belt-and-braces: a stray env change must NOT load a non-Qwen GGUF
+    // into the prod slot. Set CHIMERE_FORCE_QWEN35=1 in the production
+    // service unit to enforce this.
+    if std::env::var("CHIMERE_FORCE_QWEN35").is_ok() && arch != ModelArch::Qwen35A3B {
+        eprintln!(
+            "[chimere-server] Fatal: CHIMERE_FORCE_QWEN35=1 but GGUF arch is {}",
+            arch.name()
+        );
+        std::process::exit(1);
+    }
+
+    // -----------------------------------------------------------------
+    // Load model according to arch.
+    //
+    // Qwen3.5 — three paths ordered by performance:
+    //   1. CHIMERE_LLAMA_BACKEND=1 (93 tok/s, prod default)
+    //   2. CHIMERE_CUDARC_FORWARD=1 (~39 tok/s, dev/debug)
+    //   3. Default: full Candle path via from_gguf()
+    //
+    // Generic (Mamba/Nemotron) — single path: GenericModel::from_env(arch).
+    // CHIMERE_LLAMA_BACKEND / CHIMERE_CUDARC_FORWARD are ignored on the
+    // Generic path (libllama is implicit, cudarc is unsupported).
+    // -----------------------------------------------------------------
+    let app_model: AppStateModel = match arch {
+        ModelArch::Qwen35A3B => {
+            let qwen = if llama_backend {
+                eprintln!("[chimere-server] LLAMA_BACKEND mode: loading via libllama.so (93 tok/s)...");
+                let shell = match Qwen35Model::cudarc_shell(&model_path, &device) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("[chimere-server] Fatal: shell creation failed: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                if let Err(e) = shell.init_llama_forward() {
+                    eprintln!("[chimere-server] Fatal: llama_backend init failed: {}", e);
+                    std::process::exit(1);
+                }
+                eprintln!("[chimere-server] libllama backend ready.");
+                shell
+            } else if cudarc_forward {
+                eprintln!("[chimere-server] CUDARC mode: loading lightweight shell (no Candle weights)...");
+                let shell = match Qwen35Model::cudarc_shell(&model_path, &device) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("[chimere-server] Fatal: cudarc shell creation failed: {}", e);
+                        std::process::exit(1);
+                    }
+                };
+                eprintln!("[chimere-server] Loading cudarc weights from {} ...", model_path);
+                if let Err(e) = shell.init_cudarc_forward() {
+                    eprintln!("[chimere-server] Fatal: cudarc forward init failed: {}", e);
+                    std::process::exit(1);
+                }
+                eprintln!("[chimere-server] Cudarc model ready (single load, ~14.7 GB VRAM).");
+                shell
+            } else {
+                eprintln!("[chimere-server] Loading model from {} ...", model_path);
+                let m = match Qwen35Model::from_gguf(&model_path, &device, None) {
+                    Ok(m) => {
+                        eprintln!("[chimere-server] Model loaded (Candle path).");
+                        m
+                    }
+                    Err(e) => {
+                        eprintln!("[chimere-server] Fatal: model load failed: {}", e);
+                        std::process::exit(1);
+                    }
+                };
                 m
-            }
-            Err(e) => {
-                eprintln!("[chimere-server] Fatal: model load failed: {}", e);
+            };
+            AppStateModel::Qwen35(qwen)
+        }
+        ModelArch::Mamba1 | ModelArch::Mamba2 | ModelArch::NemotronHMoe => {
+            eprintln!(
+                "[chimere-server] GENERIC mode: loading {} via libllama FFI...",
+                arch.name()
+            );
+            // Generic models REQUIRE an external HF tokenizer.json (Step 7
+            // ships only the HF path; FFI fallback is Step 7.5).
+            if tokenizer_path.is_none() {
+                eprintln!(
+                    "[chimere-server] Fatal: arch {} requires CHIMERE_TOKENIZER \
+                     to point at a HuggingFace tokenizer.json. The built-in \
+                     libllama tokenizer is available via the trait but not \
+                     yet wired into the HTTP path.",
+                    arch.name()
+                );
                 std::process::exit(1);
             }
-        };
-
-        // NOTE: Do NOT call init_cudarc_forward() here — it would load a
-        // second copy of all weights (~14 GB) causing OOM on 16 GB GPUs.
-        // The Candle path uses QMatMul directly for inference.
-        m
+            if llama_backend {
+                eprintln!(
+                    "[chimere-server] Note: CHIMERE_LLAMA_BACKEND=1 is implicit for Generic archs."
+                );
+            }
+            if cudarc_forward {
+                eprintln!(
+                    "[chimere-server] Warning: CHIMERE_CUDARC_FORWARD=1 ignored for {} (no cudarc path).",
+                    arch.name()
+                );
+            }
+            // GenericModel::from_env reads CHIMERE_MODEL etc. internally.
+            match GenericModel::from_env(arch) {
+                Ok(gm) => {
+                    eprintln!(
+                        "[chimere-server] GenericModel loaded, arch={}, vocab={}, layers={}",
+                        arch.name(),
+                        chimere_deltanet::chimere_model::ChimereModel::vocab_size(&gm),
+                        chimere_deltanet::chimere_model::ChimereModel::num_layers(&gm),
+                    );
+                    AppStateModel::Generic(gm)
+                }
+                Err(e) => {
+                    eprintln!("[chimere-server] Fatal: Generic model load failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        // ModelArch is #[non_exhaustive] — future variants must be handled
+        // explicitly when added (compile error rather than silent fallthrough).
+        _ => {
+            eprintln!(
+                "[chimere-server] Fatal: arch '{}' is recognised by detect_arch but \
+                 has no loader wired into bin/chimere-server.rs. Add a match arm.",
+                arch.name()
+            );
+            std::process::exit(1);
+        }
     };
 
     // -----------------------------------------------------------------
@@ -227,7 +299,7 @@ async fn main() {
     eprintln!("[chimere-server] AgentScheduler: max_agents={}", max_agents);
 
     let state = Arc::new(AppState {
-        model: Mutex::new(model),
+        model: Mutex::new(app_model),
         tokenizer,
         model_name,
         agent_scheduler: Mutex::new(chimere_deltanet::agent_scheduler::AgentScheduler::new(max_agents)),
