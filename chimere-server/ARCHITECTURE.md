@@ -662,3 +662,335 @@ pub fn step_accuracy(block: &MaskedBlock) -> f64;
 
 6. **GQA over MHA**: 4 KV groups (32q/8kv) reduces KV cache by 4×
    with minimal quality loss. Critical for fitting in 16 GB VRAM.
+
+---
+
+# M1 Multi-slot + Continuous Batching (Apr 2026)
+
+This section documents the `m1-multislot` serving path landed over
+J1-J8 (2026-04-24). It describes the NEW code, not the legacy path —
+for the pre-M1 single-slot hot path see §0 "Overview" above and
+§"StateMetrics" cross-module diagram.
+
+## Motivation
+
+Before M1, `AppState.model: Mutex<AppStateModel>` serialised every
+inference under a single `tokio::sync::Mutex` (`server.rs:313`). The
+model Mutex is held for the *entire* generation (`blocking_lock`
+across the `generate_with_mtp_streaming` SSE loop at `server.rs:927`),
+and `llama_backend::kv_cache_seq_rm()` hard-codes `seq_id=0`
+(`llama_backend.rs:1015-1017`). Result: **exactly one request in
+flight at a time**, regardless of how many HTTP handlers the axum
+runtime dispatches. Aggregate throughput under N≥2 concurrent clients
+is ≈ single-request throughput, latency distribution is queue-
+dominated.
+
+M1 rewires the serving path to continuous batching (one `llama_decode`
+per step, N logical slots, per-seq K/V + sampler + engram bias
+isolation) while keeping the legacy Mutex path fully intact as the
+default. The feature flag is `CHIMERE_MULTISLOT=<N>`: unset / `1`
+selects the legacy path, `>= 2` routes through the new admission
+queue + scheduler.
+
+## Dataflow
+
+```
+      ┌──────────────────────────────────────────────────────────────┐
+      │ HTTP clients (axum, N concurrent requests)                   │
+      │   POST /v1/chat/completions                                  │
+      └────────────────────────┬─────────────────────────────────────┘
+                               │
+                               │  ChatRequest → ScheduledRequest{
+                               │      prompt, params, engram_hint,
+                               │      tx: mpsc::Sender<StreamMsg>,
+                               │      metadata: ScheduledRequestMeta }
+                               ▼
+      ┌──────────────────────────────────────────────────────────────┐
+      │ AdmissionQueue: mpsc::Sender<ScheduledRequest>               │
+      │   bounded at `ADMISSION_QUEUE_CAP` (64 by default)           │
+      │   back-pressure via `send().await` when full                 │
+      └────────────────────────┬─────────────────────────────────────┘
+                               │
+                               │  blocking_recv() from the one worker
+                               ▼
+      ┌──────────────────────────────────────────────────────────────┐
+      │ SchedulerTask (1 OS thread, `chimere-sched-dispatch`)        │
+      │                                                              │
+      │   loop {                                                     │
+      │     admit_new():                                             │
+      │       drain rx; alloc_free Slot; init KV pages;              │
+      │       park request if all slots busy                         │
+      │                                                              │
+      │     step():                                                  │
+      │       build_decode_batch():                                  │
+      │         for slot in active:                                  │
+      │           Prefilling → push prefill chunk (no cross-seq      │
+      │             in same batch — see J4 caveat below)             │
+      │           Generating → push 1 tok @ slot.pos, logits=1       │
+      │                                                              │
+      │       forward_multi_seq(ctx, batch)                          │
+      │         → one `llama_decode` call for the whole batch        │
+      │         → returns (seq_id, logits[vocab_size]) for each      │
+      │           entry with `request_logits=true`                   │
+      │                                                              │
+      │       per-slot sample:                                       │
+      │         for slot in active:                                  │
+      │           if !slot.thinking:                                 │
+      │             apply_engram_bias_to_sampler()                   │
+      │               = alpha * ln(prob + 1e-10), per-slot sampler   │
+      │           (tok, lp) = sample_slot_with_logprobs(sampler,     │
+      │                           ctx, slot.batch_idx)               │
+      │           slot.accept_token(tok)                             │
+      │           slot.tx.send(StreamMsg::{Token, Thinking, …})      │
+      │           if slot.should_finish(tok): free_slot(slot)        │
+      │   }                                                          │
+      │                                                              │
+      │   SlotPool = Vec<Slot>[NUM_SLOTS]                            │
+      │   ├─ Slot 0: seq=0, sampler_0, engram_0, kv-pages seq 0      │
+      │   ├─ Slot 1: seq=1, sampler_1, engram_1, kv-pages seq 1      │
+      │   ├─ Slot 2: FREE (seq pre-assigned, pages empty)            │
+      │   └─ Slot 3: FREE                                            │
+      └────────────────────────┬─────────────────────────────────────┘
+                               │
+                               │  per-slot mpsc::Sender<StreamMsg>
+                               │  (one channel per admitted request)
+                               ▼
+      ┌──────────────────────────────────────────────────────────────┐
+      │ axum handlers — map StreamMsg → SSE `data:` frames           │
+      │   { Token { text, logprob } } → `"delta":{"content":…}`      │
+      │   { Thinking { text } }       → `"delta":{"reasoning_…":…}`  │
+      │   { ToolCall { json } }       → `"delta":{"tool_calls":…}`   │
+      │   { Done { finish_reason } }  → `"finish_reason":…`          │
+      │   { Error { message } }       → 500 + SSE comment            │
+      └──────────────────────────────────────────────────────────────┘
+```
+
+### Per-seq vs per-slot — where the data lives
+
+| Entity                        | Per-seq   | Per-slot | Global (shared) |
+|-------------------------------|:---------:|:--------:|:---------------:|
+| KV cache pages (libllama)     |    X      |          |                 |
+| SSM / GDN state (hybrid arch) |    X      |          |                 |
+| `chimere_sampler` handle      |           |    X     |                 |
+| logit_bias map                |           |    X     |                 |
+| DRY / repetition history      |           |    X     |                 |
+| engram **tables** (mmap)      |           |          |       X         |
+| engram bias **applied**       |           |    X     |                 |
+| tokenizer                     |           |          |       X         |
+| model weights (GGUF mmap)     |           |          |       X         |
+| `</think>` suppression `-inf` |           |    X     |                 |
+| mpsc stream channel           |           |    X     |                 |
+| `cancelled` atomic            |           |    X     |                 |
+
+A `Slot` owns its `SamplerHandle` (a `*mut c_void` into
+`chimere_sampler.cpp` allocated via `chimere_sampler_alloc_with_dry`).
+The handle is `Send` but never `Clone`; the destructor calls
+`chimere_sampler_free_handle`, so slot lifetime drives sampler
+lifetime. Engram *tables* stay global (mmap'd `.engr` files, read-only
+after boot) but the *biases derived from a lookup* are pushed into the
+per-slot sampler via `chimere_sampler_set_engram_bias_handle`.
+
+### Feature flag semantics
+
+`SchedulerConfig::from_env()` reads `CHIMERE_MULTISLOT` and clamps to
+`[1, NUM_SLOTS_MAX=8]`:
+
+| Value     | `enabled` | Path                                                 |
+|-----------|:---------:|------------------------------------------------------|
+| unset     |  false    | Legacy `Mutex<AppStateModel>` — production default   |
+| `0`, `1`  |  false    | Legacy path                                          |
+| `2`       |  true     | 2 slots, admission queue routed                      |
+| `3-8`     |  true     | N slots, capped at 8                                 |
+| `≥ 9`     |  true     | Capped to 8, warning printed                         |
+
+The scheduler is wired in `bin/chimere-server.rs:312-342`. When
+disabled, `AppState.scheduler = None` and `AppState.multislot_active()
+== false`; every handler takes the legacy path (see J4 note below for
+the in-flight dispatcher rewrite).
+
+## Module responsibilities
+
+### `src/slot_scheduler.rs` (new, ~960 lines)
+
+- `SchedulerConfig` + `Scheduler` + `SlotPool` + `Slot` + `BatchBuilder`.
+- `ScheduledRequest` holds a `Box<dyn FnOnce(ScheduledRequestMeta) + Send>`
+  closure so the scheduler is decoupled from `chimere_model::*`.
+  `ScheduledRequestMeta` carries `request_id`, prompt token count,
+  `cancelled` flag (client-disconnect signalling), and `enqueued_at`
+  for queue-wait telemetry.
+- `SlotState` = `Free | Prefilling { chunks_done } | Generating |
+  Draining`. State transitions live on `Slot`, not on an external
+  FSM — keeps invariants local.
+- `Slot::apply_engram_bias_to_sampler()` — implements the production
+  formula `alpha * ln(prob + eps)` identically to `mtp_scheduler.rs`
+  so the multi-slot path is numerically equivalent to the single-slot
+  path on the same prompt.
+- `SlotPool::alloc_samplers_with_dry()` — allocates N independent
+  `chimere_sampler` via `chimere_sampler_alloc_with_dry`, rolling back
+  to "no sampler" if any slot fails. Called once at scheduler boot.
+- `SamplerHandle` / `EngramHandle` — owning FFI wrappers.
+  `SamplerHandle` is `Send` but `!Sync` and `!Clone`; `EngramHandle`
+  is `Clone` (wraps `Arc<MultiEngramLookup>`).
+
+### `src/llama_backend.rs` (J3 additions, ~210 lines)
+
+- `LlamaForward::forward_multi_seq(&mut self, entries: &[MultiSeqEntry])
+  -> Result<Vec<(i32, Vec<f32>)>, String>` — single `llama_decode`
+  call composing N seq_ids in one batch. Returns per-entry logits for
+  entries that requested them.
+- `MultiSeqEntry { token, pos, seq_id, request_logits }` — input shape.
+- `LlamaForward::kv_cache_seq_rm_for(seq_id) -> bool` — releases KV
+  pages owned by a finished seq. The legacy call site at line 1015
+  (`kv_cache_seq_rm(-1, -1, -1)`) still exists for the single-slot
+  path.
+- `LlamaForward::sample_slot_with_logprobs(sampler, idx)` — per-slot
+  sample + logprobs from a given batch index (used by the scheduler's
+  per-slot sample step).
+- FFI extern declarations for
+  `chimere_sampler_alloc_with_dry`,
+  `chimere_sampler_set_engram_bias_handle`,
+  `chimere_sampler_set_logit_bias_handle`,
+  `chimere_sampler_clear_engram_bias_handle`,
+  `chimere_sampler_reset_handle`,
+  `chimere_sampler_free_handle`.
+
+### `ffi/chimere_sampler.cpp` (J5 rewrite, ~290 lines)
+
+Rewritten from the libcommon-based sampler (`common_sampler_init`,
+crashed at startup on 2026-04-24 due to an ABI drift in
+`struct common_sampler`) to a minimal libllama-only chain. See
+`~/Bureau/chimere-sampler-unblock-2026-04-24.md` for the full
+investigation.
+
+- `struct chimere_sampler` — per-instance state: sampling knobs
+  (`temperature`, `top_p`, `top_k`, `min_p`, presence/DRY params),
+  a `std::unordered_map<llama_token,float>` for the logit_bias map,
+  a `std::vector<llama_token>` for `prev` history, and a
+  `std::mt19937` RNG.
+- `sample_chain()` — `repetition penalties → top-k → top-p → min-p
+  → temperature → llama_sample_token`. Greedy when `temp ≤ 0`.
+- `chimere_sampler_set_engram_bias_handle(token_ids, biases, n)` —
+  installs the engram-derived biases on top of any existing logit
+  biases. Preserves manual `-inf` biases (e.g. `</think>` suppression
+  from the `generate.rs` path).
+- `chimere_sampler_set_logit_bias_handle` / `_clear_engram_bias_handle`
+  — auxiliary ABI for tests and the scheduler's slot free path.
+- No dependency on `libcommon.a`; the `ffi/build.rs` link line was
+  pruned accordingly.
+
+### `src/server.rs` (J2 touch, ~30 lines)
+
+- `AppState` grows `pub scheduler: Option<Arc<Scheduler>>` and a
+  `multislot_active()` helper. Single-slot callers ignore the field.
+- `bin/chimere-server.rs` builds the scheduler iff
+  `SchedulerConfig::from_env().is_active()`, spawns the dispatcher
+  thread via `Scheduler::spawn_workers()`, and detaches the JoinHandle
+  (dispatcher is process-lifetime).
+
+## State machine per slot
+
+```
+          ┌──────┐
+          │ Free │ ←────────────────────────────────────────┐
+          └──┬───┘                                          │
+             │ admit_new: prompt tokenised, KV pages        │
+             │ pre-reserved, engram alpha bound             │
+             ▼                                              │
+   ┌────────────────────────┐                               │
+   │ Prefilling {           │                               │
+   │   chunks_done: 0..K    │                               │
+   │ }                      │                               │
+   └──┬─────────────────────┘                               │
+      │ last prefill chunk accepted, logits requested       │
+      ▼                                                     │
+   ┌────────────┐                                           │
+   │ Generating │──────────┐                                │
+   └──┬─────────┘          │ stop-token / max_tokens        │
+      │ client disconnect  │ hit → schedule Draining        │
+      │ (cancelled=true)   │                                │
+      ▼                    ▼                                │
+   ┌────────────┐    ┌──────────┐                           │
+   │  Draining  │◄───│ Generating│ (state unchanged, emits  │
+   │ (one step) │    └──────────┘  Done on next step)       │
+   └──┬─────────┘                                           │
+      │ Done marker emitted, KV pages released via          │
+      │ llama_kv_cache_seq_rm(ctx, seq_id, 0, -1),          │
+      │ sampler.clear_engram_bias() + .reset(),             │
+      │ SlotPool::free_notify.notify_one()                  │
+      └─────────────────────────────────────────────────────┘
+```
+
+## Batch construction invariants
+
+From the J4 smoke (`bin/j4_smoke.rs`), ik_llama's `qwen3next` path
+**does not** accept mixed prefill + generate for the same seq_id in
+the same `llama_decode` batch — it logs
+`qwen3next mixed-sequence batch contains repeated seq_id values;
+falling back to single-token chunking` and reorders the batch,
+breaking the isolated-baseline equivalence we rely on.
+
+The scheduler's `BatchBuilder` therefore honours two invariants per
+call:
+
+1. **No repeated seq_id within one `llama_decode` batch.** A slot
+   either contributes its next prefill chunk OR one generate token,
+   never both in the same step.
+2. **Logits requested only for the tokens we will sample.** The
+   `logits: Vec<i8>` flag is `1` for the last prefill token (so the
+   first generate step has something to sample from) and for every
+   generate step; it is `0` for all other prefill tokens.
+
+Cross-seq mixing is fine — a batch of `{A prefill chunk 512 tokens, B
+gen 1 token, C gen 1 token}` works as long as no seq_id appears more
+than once. J4 smoke proves seq-1's token stream is bit-for-bit
+identical whether it runs alone or interleaved with a 512-token
+prefill of seq-0.
+
+## MTP gating
+
+MTP (multi-token prediction speculative decoding, `mtp_scheduler.rs`)
+mutates `mtp_op_type` on the *context-wide* `llama_forward` state, not
+per-seq. A multi-slot MTP would require per-seq MTP state that
+ik_llama does not (yet) support. Policy:
+
+- `CHIMERE_MULTISLOT >= 2` and **any** slot wants MTP → scheduler
+  routes that slot into a "slot-exclusive" mode: no other slot may be
+  Generating while MTP is active, and the batch falls back to
+  single-seq for the duration.
+- Default: **MTP disabled** when `CHIMERE_MULTISLOT >= 2`, a warning
+  is logged at boot. J6 will finalise the slot-exclusive mechanism;
+  until then, the multi-slot path generates without MTP speculation
+  and accepts the ~5-8% throughput loss vs single-slot MTP.
+- The single-slot path (`CHIMERE_MULTISLOT` unset / `1`) is unchanged
+  — MTP stays armed via the legacy `generate_with_mtp_streaming`.
+
+## Status (J8, 2026-04-24)
+
+| Layer                                   | Status | Smoke                     |
+|-----------------------------------------|:------:|---------------------------|
+| `slot_scheduler.rs` types + admission   |  OK    | `j2-smoke` PASS           |
+| `forward_multi_seq` FFI                 |  OK    | `j3-smoke` PASS           |
+| chunked prefill + concurrent gen        |  OK    | `j4-smoke` PASS           |
+| per-slot sampler + engram isolation     |  OK    | `j5-smoke` PASS (Apr 24)  |
+| HTTP dispatcher → `forward_multi_seq`   |  WIP   | deferred from J4 brief    |
+| stop / cancel / disconnect cleanup      |  PENDING | J6                      |
+| stress (4c, 8 backlog, 1000-req leak)   |  PENDING | J7                      |
+| bench harness                           |  OK    | `bench-m1` + `scripts/bench_m1.sh` |
+
+Production `:8081` is not touched by any of this — the legacy path is
+byte-for-byte unchanged for `CHIMERE_MULTISLOT` unset. The M1 path
+activates only when the env var is explicitly set to `>= 2`.
+
+## Files
+
+- `chimere-server/src/slot_scheduler.rs` — scheduler + slot + FFI
+  handles (~960 lines, created J1, extended J2/J5)
+- `chimere-server/src/llama_backend.rs:1015+` — `forward_multi_seq`,
+  `kv_cache_seq_rm_for`, `sample_slot_with_logprobs` (added J3/J5)
+- `chimere-server/ffi/chimere_sampler.cpp` — libllama-only sampler
+  chain (rewritten J5)
+- `chimere-server/src/server.rs:308+` — `AppState.scheduler`
+- `chimere-server/src/bin/chimere-server.rs:312` — scheduler wiring
+- `chimere-server/src/bin/{j2,j3,j4,j5}_smoke.rs` — per-step smokes
+- `chimere-server/src/bin/bench_m1.rs` — J8 bench harness
+- `scripts/bench_m1.sh` — concurrency sweep wrapper
