@@ -1915,6 +1915,34 @@ async fn status_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse
 }
 
 // ---------------------------------------------------------------------------
+// Profile report + reset (stdlib-only timing spans, gated by CHIMERE_PROFILE=1)
+// ---------------------------------------------------------------------------
+
+/// GET /v1/profile — current profile report as plain text (tab-separated).
+///
+/// When `CHIMERE_PROFILE` is unset / "0" the gate is off, the three hot-path
+/// `prof!` sites are no-ops, and this endpoint returns a header line with
+/// `enabled=false` plus an empty table. No harm in polling from prod.
+async fn profile_report() -> impl IntoResponse {
+    let body = crate::profile::report();
+    (
+        StatusCode::OK,
+        [("content-type", "text/plain; charset=utf-8")],
+        body,
+    )
+}
+
+/// POST /v1/profile/reset — zero every registered counter in place.
+///
+/// Counter pointers (cached inside the `prof!` call-site `OnceLock`s) are
+/// preserved, so the next tick starts accumulating from zero without any
+/// re-registration cost. Returns 204 No Content.
+async fn profile_reset() -> impl IntoResponse {
+    crate::profile::reset();
+    StatusCode::NO_CONTENT
+}
+
+// ---------------------------------------------------------------------------
 // Router factory
 // ---------------------------------------------------------------------------
 
@@ -1925,5 +1953,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/health", get(health))
         .route("/metrics", get(metrics_handler))
         .route("/v1/status", get(status_handler))
+        .route("/v1/profile", get(profile_report))
+        .route("/v1/profile/reset", post(profile_reset))
         .with_state(state)
 }

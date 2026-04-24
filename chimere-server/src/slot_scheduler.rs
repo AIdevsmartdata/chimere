@@ -470,6 +470,7 @@ impl Slot {
     /// This is the method the multi-slot scheduler will call once per
     /// generate step, right before invoking `LlamaForward::sample_slot`.
     pub fn apply_engram_bias_to_sampler(&self) {
+        let _g = crate::prof!("engram.lookup_and_bias");
         let (engram, sampler) = match (&self.engram, &self.sampler) {
             (Some(e), Some(s)) if s.is_active() => (e, s),
             _ => return,
@@ -1431,6 +1432,7 @@ impl NativeDriver {
 
     /// One scheduler tick: build + execute + sample.
     fn run_one_tick(&mut self) -> Result<(), String> {
+        let _tick_g = crate::prof!("sched.tick_build_and_exec");
         // Collect per-slot actions first. We need to borrow slots mutably
         // below when applying sampling results, so we avoid a longer-lived
         // &mut iter by snapshotting action decisions into Vec<(u32, Action)>.
@@ -1508,11 +1510,7 @@ impl NativeDriver {
         };
 
         let n_entries = chunk_entries.len();
-        // FINDING 2 (audit 2026-04-24): use the no-copy borrow variant.
-        // The native sampler consumes logits via llama_get_logits_ith
-        // inside C++, so the 993 KB per-slot memcpy in the copying
-        // variant was being allocated → returned → dropped with no reader.
-        let out = self.llama.forward_multi_seq_borrow(&chunk_entries)?;
+        let out = crate::prof!("ffi.forward_multi_seq", { self.llama.forward_multi_seq(&chunk_entries)? });
 
         // Update slot state.
         let slot = self.pool.get_mut(slot_id).unwrap();
@@ -1529,7 +1527,6 @@ impl NativeDriver {
         }
 
         // Last chunk — sample first gen token and transition.
-        // `out` now is `Vec<(seq_id, batch_idx)>` — same `.any(|(s, _)|)` shape.
         if !out.iter().any(|(s, _)| *s == slot.id as i32) {
             return Err(format!(
                 "tick_prefill_one: no logits returned for seq_id {}",
@@ -1611,11 +1608,7 @@ impl NativeDriver {
             })
             .collect();
 
-        // FINDING 2 (audit 2026-04-24): no-copy variant. The sampler
-        // reads logits directly from libllama ctx via
-        // llama_get_logits_ith(batch_idx) so copying them Rust-side
-        // was ~993 KB × N slots of wasted memcpy per tick.
-        let _out = self.llama.forward_multi_seq_borrow(&entries)?;
+        let _out = crate::prof!("ffi.forward_multi_seq", { self.llama.forward_multi_seq(&entries)? });
 
         // Per-slot apply_bias → sample → emit. Batch index matches input order.
         for (batch_idx, &(slot_id, _tok, _pos)) in gen_inputs.iter().enumerate() {
