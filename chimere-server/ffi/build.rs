@@ -10,12 +10,33 @@ use std::env;
 use std::process::Command;
 
 fn main() {
+    // --- ik_llama.cpp path resolution (community-friendly) ---
+    // Precedence per var:
+    //   1. explicit env override (e.g. GGML_SO_DIR)
+    //   2. derived from IKLLAMACPP_DIR + IK_LLAMA_BUILD_SUBDIR
+    //   3. $HOME/ik_llama.cpp + build_sm120 (matches install-chimere.sh default)
+    println!("cargo:rerun-if-env-changed=IKLLAMACPP_DIR");
+    println!("cargo:rerun-if-env-changed=IK_LLAMA_BUILD_SUBDIR");
+    println!("cargo:rerun-if-env-changed=GGML_SO_DIR");
+    println!("cargo:rerun-if-env-changed=GGML_INCLUDE_DIR");
+    println!("cargo:rerun-if-env-changed=GGML_SRC_DIR");
+    println!("cargo:rerun-if-env-changed=GGML_COMMON_DIR");
+    println!("cargo:rerun-if-env-changed=IK_LLAMA_INCLUDE");
+    println!("cargo:rerun-if-env-changed=IK_LLAMA_SRC");
+
+    let iklama_dir = env::var("IKLLAMACPP_DIR").unwrap_or_else(|_| {
+        let home = env::var("HOME").unwrap_or_else(|_| "/root".into());
+        format!("{}/ik_llama.cpp", home)
+    });
+    let build_subdir = env::var("IK_LLAMA_BUILD_SUBDIR")
+        .unwrap_or_else(|_| "build_sm120".into());
+
     let ggml_so_dir = env::var("GGML_SO_DIR")
-        .unwrap_or_else(|_| "{IKLLAMACPP_DIR}/build_sm120/ggml/src".to_string());
+        .unwrap_or_else(|_| format!("{}/{}/ggml/src", iklama_dir, build_subdir));
     let ggml_include_dir = env::var("GGML_INCLUDE_DIR")
-        .unwrap_or_else(|_| "{IKLLAMACPP_DIR}/ggml/include".to_string());
+        .unwrap_or_else(|_| format!("{}/ggml/include", iklama_dir));
     let ggml_src_dir = env::var("GGML_SRC_DIR")
-        .unwrap_or_else(|_| "{IKLLAMACPP_DIR}/ggml/src".to_string());
+        .unwrap_or_else(|_| format!("{}/ggml/src", iklama_dir));
 
     // Check if the shared library exists
     let so_path = format!("{}/libggml.so", ggml_so_dir);
@@ -43,13 +64,13 @@ fn main() {
     // Part 1c: Compile chimere_sampler.cpp (C++ sampler wrapper — avoids 993KB logits copy)
     // -----------------------------------------------------------------------
     let common_dir = env::var("GGML_COMMON_DIR")
-        .unwrap_or_else(|_| "{IKLLAMACPP_DIR}/common".to_string());
+        .unwrap_or_else(|_| format!("{}/common", iklama_dir));
 
     let ik_llama_include = env::var("IK_LLAMA_INCLUDE")
-        .unwrap_or_else(|_| "{IKLLAMACPP_DIR}/include".to_string());
+        .unwrap_or_else(|_| format!("{}/include", iklama_dir));
 
     let ik_llama_src = env::var("IK_LLAMA_SRC")
-        .unwrap_or_else(|_| "{IKLLAMACPP_DIR}/src".to_string());
+        .unwrap_or_else(|_| format!("{}/src", iklama_dir));
 
     cc::Build::new()
         .cpp(true)

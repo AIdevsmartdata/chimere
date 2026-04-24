@@ -76,8 +76,33 @@ fn main() {
         }
     }
 
+    // --- ik_llama.cpp path resolution (community-friendly) ---
+    // Precedence:
+    //   1. explicit env override (IKLLAMACPP_DIR, LLAMA_LIB_DIR, GGML_LIB_DIR)
+    //   2. $HOME/ik_llama.cpp (default install location — matches install-chimere.sh)
+    //
+    // Build subdir is `build_sm120` on Blackwell and `build_sm89` on Ada;
+    // users override via IK_LLAMA_BUILD_SUBDIR when they built against a
+    // different SM target.
+    println!("cargo:rerun-if-env-changed=IKLLAMACPP_DIR");
+    println!("cargo:rerun-if-env-changed=LLAMA_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=GGML_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=IK_LLAMA_BUILD_SUBDIR");
+
+    let iklama_dir = std::env::var("IKLLAMACPP_DIR")
+        .unwrap_or_else(|_| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+            format!("{}/ik_llama.cpp", home)
+        });
+    let build_subdir = std::env::var("IK_LLAMA_BUILD_SUBDIR")
+        .unwrap_or_else(|_| "build_sm120".into());
+    let llama_lib_dir = std::env::var("LLAMA_LIB_DIR")
+        .unwrap_or_else(|_| format!("{}/{}/src", iklama_dir, build_subdir));
+    let ggml_lib_dir = std::env::var("GGML_LIB_DIR")
+        .unwrap_or_else(|_| format!("{}/{}/ggml/src", iklama_dir, build_subdir));
+
     // Propagate ggml_cuda_gemv feature for src/kernels/ggml_gpu.rs
-    let has_ggml_so = std::path::Path::new("{IKLLAMACPP_DIR}/build_sm120/ggml/src/libggml.so").exists();
+    let has_ggml_so = std::path::Path::new(&format!("{}/libggml.so", ggml_lib_dir)).exists();
     if has_ggml_so {
         println!("cargo:rustc-cfg=feature=\"ggml_cuda_gemv\"");
     }
@@ -87,8 +112,6 @@ fn main() {
     // Link against ik_llama's libllama.so and libggml.so for the full forward pass backend.
     // These are always linked (the LlamaForward struct is only instantiated at runtime
     // when CHIMERE_LLAMA_BACKEND=1, so the dynamic linker resolves symbols lazily).
-    let llama_lib_dir = "{IKLLAMACPP_DIR}/build_sm120/src";
-    let ggml_lib_dir = "{IKLLAMACPP_DIR}/build_sm120/ggml/src";
     let has_libllama = std::path::Path::new(&format!("{}/libllama.so", llama_lib_dir)).exists();
     let has_libggml = std::path::Path::new(&format!("{}/libggml.so", ggml_lib_dir)).exists();
 
@@ -101,10 +124,14 @@ fn main() {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", llama_lib_dir);
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", ggml_lib_dir);
         println!("cargo:rustc-cfg=has_libllama");
-        eprintln!("chimere-deltanet build.rs: libllama.so + libggml.so found, llama_backend enabled");
+        eprintln!(
+            "chimere-deltanet build.rs: libllama.so + libggml.so found at {} / {}, llama_backend enabled",
+            llama_lib_dir, ggml_lib_dir,
+        );
     } else {
         eprintln!(
-            "chimere-deltanet build.rs: WARNING: libllama.so ({}) or libggml.so ({}) not found, \
+            "chimere-deltanet build.rs: WARNING: libllama.so ({}) or libggml.so ({}) not found. \
+             Set IKLLAMACPP_DIR or run install-chimere.sh first. \
              llama_backend will fail at runtime if CHIMERE_LLAMA_BACKEND=1",
             llama_lib_dir, ggml_lib_dir,
         );

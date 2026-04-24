@@ -105,8 +105,26 @@ cmake --build build_sm120 -j
 # Server
 git clone https://github.com/AIdevsmartdata/chimere.git
 cd chimere/chimere-server
-LD_LIBRARY_PATH=$HOME/ik_llama.cpp/build_sm120/ggml/src:$HOME/ik_llama.cpp/build_sm120/src:/usr/local/cuda-12.8/lib64 \
+cargo build --release --features server --bin chimere-server
+```
+
+`build.rs` and `ffi/build.rs` resolve `IKLLAMACPP_DIR` (default
+`$HOME/ik_llama.cpp`) and `IK_LLAMA_BUILD_SUBDIR` (default `build_sm120`),
+so the build finds `libllama.so` / `libggml.so` without manual exports.
+Override either when your backend lives elsewhere, e.g.:
+
+```sh
+IKLLAMACPP_DIR=/opt/ik_llama IK_LLAMA_BUILD_SUBDIR=build_sm89 \
   cargo build --release --features server --bin chimere-server
+```
+
+At **runtime**, the binary still needs `LD_LIBRARY_PATH` to find the
+shared libraries unless you rely on the embedded rpath (set automatically
+when libraries are discovered at build time):
+
+```sh
+LD_LIBRARY_PATH=$HOME/ik_llama.cpp/build_sm120/ggml/src:$HOME/ik_llama.cpp/build_sm120/src:/usr/local/cuda-12.8/lib64 \
+  ./target/release/chimere-server
 ```
 
 Requirements: CUDA 12.8 toolkit, Rust 1.80+, an NVIDIA GPU with at least 16 GB

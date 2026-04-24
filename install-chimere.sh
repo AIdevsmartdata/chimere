@@ -159,6 +159,11 @@ build_server() {
   local ld_path="$IK_LLAMA_DIR/$BUILD_DIR_NAME/ggml/src:$IK_LLAMA_DIR/$BUILD_DIR_NAME/src:$CUDA_PREFIX/lib64"
   (
     cd "$REPO_ROOT/chimere-server"
+    # Expose build-time paths for build.rs + ffi/build.rs
+    # (they resolve IKLLAMACPP_DIR + IK_LLAMA_BUILD_SUBDIR with sensible
+    #  fallbacks, but we pin them here for deterministic builds).
+    IKLLAMACPP_DIR="$IK_LLAMA_DIR" \
+    IK_LLAMA_BUILD_SUBDIR="$BUILD_DIR_NAME" \
     LD_LIBRARY_PATH="$ld_path" \
       cargo build --release --features server --bin chimere-server
   )

@@ -42,15 +42,17 @@ BENCH_SWEEP="${BENCH_SWEEP:-1 2 4}"
 BENCH_SKIP_SERVER="${BENCH_SKIP_SERVER:-0}"
 
 # Same paths as chimere-m1-j3-build.sh — reuse so the build env is identical.
-export IKLLAMACPP_DIR="${IKLLAMACPP_DIR:-/home/remondiere/ik_llama.cpp}"
-export GGML_SO_DIR="${GGML_SO_DIR:-${IKLLAMACPP_DIR}/build_sm120/ggml/src}"
-export LLAMA_SO_DIR="${LLAMA_SO_DIR:-${IKLLAMACPP_DIR}/build_sm120/src}"
+# Override IKLLAMACPP_DIR / IK_LLAMA_BUILD_SUBDIR to point at your local clone.
+export IKLLAMACPP_DIR="${IKLLAMACPP_DIR:-$HOME/ik_llama.cpp}"
+export IK_LLAMA_BUILD_SUBDIR="${IK_LLAMA_BUILD_SUBDIR:-build_sm120}"
+export GGML_SO_DIR="${GGML_SO_DIR:-${IKLLAMACPP_DIR}/${IK_LLAMA_BUILD_SUBDIR}/ggml/src}"
+export LLAMA_SO_DIR="${LLAMA_SO_DIR:-${IKLLAMACPP_DIR}/${IK_LLAMA_BUILD_SUBDIR}/src}"
 export GGML_INCLUDE_DIR="${GGML_INCLUDE_DIR:-${IKLLAMACPP_DIR}/ggml/include}"
 export GGML_SRC_DIR="${GGML_SRC_DIR:-${IKLLAMACPP_DIR}/ggml/src}"
 export GGML_COMMON_DIR="${GGML_COMMON_DIR:-${IKLLAMACPP_DIR}/common}"
 export IK_LLAMA_INCLUDE="${IK_LLAMA_INCLUDE:-${IKLLAMACPP_DIR}/include}"
 export IK_LLAMA_SRC="${IK_LLAMA_SRC:-${IKLLAMACPP_DIR}/src}"
-export GGML_COMMON_LIB_DIR="${GGML_COMMON_LIB_DIR:-${IKLLAMACPP_DIR}/build_sm120/common}"
+export GGML_COMMON_LIB_DIR="${GGML_COMMON_LIB_DIR:-${IKLLAMACPP_DIR}/${IK_LLAMA_BUILD_SUBDIR}/common}"
 export CUDA_LIB_DIR="${CUDA_LIB_DIR:-/usr/local/cuda-12.8/targets/x86_64-linux/lib}"
 export LD_LIBRARY_PATH="${GGML_SO_DIR}:${LLAMA_SO_DIR}:/usr/local/cuda-12.8/lib64:${LD_LIBRARY_PATH:-}"
 
