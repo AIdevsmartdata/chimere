@@ -56,6 +56,25 @@ name = "j3-smoke"
 path = "src/bin/j3_smoke.rs"
 required-features = ["server"]
 
+# M1 J4 smoke test — chunked prefill of seq 0 interleaved with seq 1 gen
+# inside the same forward_multi_seq batches. Proves mixed batches
+# (prefill + generate, different request_logits flags) do not leak
+# across sequences. Compares seq 1's stream to an isolated baseline.
+[[bin]]
+name = "j4-smoke"
+path = "src/bin/j4_smoke.rs"
+required-features = ["server"]
+
+# M1 J5 smoke test — per-slot sampler handles + per-slot engram biases.
+# Allocates N independent C++ samplers, applies DIFFERENT engram bias
+# tables per slot, and asserts the resulting logit-modified distributions
+# diverge. Requires CHIMERE_SKIP_SAMPLER_INIT=0 (default) so the C++
+# sampler path is exercised end-to-end.
+[[bin]]
+name = "j5-smoke"
+path = "src/bin/j5_smoke.rs"
+required-features = ["server"]
+
 [profile.release]
 opt-level = 3
 lto = "fat"

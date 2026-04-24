@@ -12,6 +12,27 @@
 #include <cmath>
 #include <algorithm>
 
+// ---------------------------------------------------------------------------
+// ik_llama grammar-apply shim (M1 J3, 2026-04-24)
+// ---------------------------------------------------------------------------
+// libcommon's sampling.cpp references llama_grammar_apply which is part of the
+// upstream llama.cpp grammar API but NOT exposed by ik_llama's libllama.
+// Chimère does not use grammar-constrained sampling (we use chimere_sampler,
+// not common_sampler's grammar path), so the symbol is never actually invoked
+// at runtime. We provide an abort-stub just to satisfy the linker for binaries
+// like j3-smoke that drag in the full libcommon.a.
+//
+// If this is ever hit, something drastically changed — fail loud.
+struct llama_grammar;
+struct llama_token_data_array;
+extern "C" void llama_grammar_apply(struct llama_grammar * /*grammar*/,
+                                    struct llama_token_data_array * /*candidates*/) {
+    std::fprintf(stderr,
+        "FATAL: llama_grammar_apply called but ik_llama does not export it.\n"
+        "Chimère does not use grammar-constrained sampling. Check caller.\n");
+    std::abort();
+}
+
 extern "C" {
 
 // Opaque sampler handle

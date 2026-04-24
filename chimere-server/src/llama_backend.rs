@@ -687,22 +687,32 @@ impl LlamaForward {
 
         // Create C++ sampler with Qwen3.5 optimal params (thinking mode)
         // Ref: Unsloth docs + Qwen3.5 official sampling recommendations
-        let sampler = unsafe {
-            chimere_sampler_init(
-                model as *const LlamaModel,
-                0.6,   // temperature — Qwen3.5 thinking mode (0.7 for chat)
-                0.95,  // top_p
-                20,    // top_k
-                0.05,  // min_p — better than top_k alone (2026 consensus)
-                0.0,   // presence_penalty (0 for thinking, 1.5 if loops)
-                0.8,   // dry_multiplier — prevents thinking loops
-                1.75,  // dry_base
-                2,     // dry_min_length
-                -1,    // dry_penalty_last_n (-1 = whole sequence)
-            )
+        //
+        // J3 smoke path: set CHIMERE_SKIP_SAMPLER_INIT=1 to skip common_sampler
+        // construction. Useful when exercising forward_multi_seq alone (j3-smoke
+        // does argmax externally and doesn't need the chimere sampler). Also
+        // avoids the libcommon grammar-path symbol that ik_llama doesn't expose.
+        let sampler = if std::env::var("CHIMERE_SKIP_SAMPLER_INIT").is_ok() {
+            eprintln!("[LLAMA_BACKEND] CHIMERE_SKIP_SAMPLER_INIT=1 → skipping C++ sampler");
+            std::ptr::null_mut()
+        } else {
+            unsafe {
+                chimere_sampler_init(
+                    model as *const LlamaModel,
+                    0.6,   // temperature — Qwen3.5 thinking mode (0.7 for chat)
+                    0.95,  // top_p
+                    20,    // top_k
+                    0.05,  // min_p — better than top_k alone (2026 consensus)
+                    0.0,   // presence_penalty (0 for thinking, 1.5 if loops)
+                    0.8,   // dry_multiplier — prevents thinking loops
+                    1.75,  // dry_base
+                    2,     // dry_min_length
+                    -1,    // dry_penalty_last_n (-1 = whole sequence)
+                )
+            }
         };
         if sampler.is_null() {
-            eprintln!("[LLAMA_BACKEND] Warning: C++ sampler init failed, falling back to Rust sampling");
+            eprintln!("[LLAMA_BACKEND] Warning: C++ sampler init skipped/failed, falling back to Rust sampling");
         } else {
             eprintln!("[LLAMA_BACKEND] C++ sampler initialized (avoids 993KB logits copy per token)");
         }
