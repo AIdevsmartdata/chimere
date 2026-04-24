@@ -21,10 +21,9 @@ once_cell = "1"
 tokio = { version = "1", features = ["full"], optional = true }
 axum = { version = "0.8", optional = true }
 futures = { version = "0.3", optional = true }
-# M1 J8 bench harness (opt-in via the `server` feature so the default
-# `chimere-deltanet` build stays light). `rustls-tls` keeps the dep tree
-# minimal — no openssl headers required at build time.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"], optional = true }
+# M1 J8 bench + J4-rewrite smoke both need an HTTP client. Use reqwest with
+# rustls (no openssl headers) + json + stream features.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"], optional = true }
 
 [features]
 cubin_fallback = []
@@ -86,12 +85,16 @@ name = "j6-smoke"
 path = "src/bin/j6_smoke.rs"
 required-features = ["server"]
 
-# M1 J8 bench harness — drives N concurrent /v1/chat/completions streams
-# against a running chimere-server binary, reports aggregate throughput,
-# per-request p50/p95/p99 latency, VRAM delta and engram-isolation.
+# M1 J8 bench harness — drives N concurrent streams against a running server.
 [[bin]]
 name = "bench-m1"
 path = "src/bin/bench_m1.rs"
+required-features = ["server"]
+
+# M1 J4-rewrite end-to-end smoke — 2 concurrent streams, interleave + distinct.
+[[bin]]
+name = "j4-rewrite-smoke"
+path = "src/bin/j4_rewrite_smoke.rs"
 required-features = ["server"]
 
 [profile.release]
