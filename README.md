@@ -1,15 +1,39 @@
-# Chimere
+# Chimère
+
+**The Rust inference runtime for local-first hybrid SSM + MoE models.**
+**35B parameters. 94 tokens/s. 16 GB consumer GPU. Single binary.**
 
 A Rust inference server for hybrid State-Space + MoE language models, built on a
-customized `ik_llama.cpp` fork. Production target: Qwen3.5-35B-A3B (Gated DeltaNet
-+ MoE) at ~80 tok/s on a single 16 GB consumer GPU. Now also runs Mamba-2 and
+customised `ik_llama.cpp` fork. Production target: Qwen3.5-35B-A3B (Gated DeltaNet
++ MoE) at ~94 tok/s on a single 16 GB consumer GPU. Also runs Mamba-2 and
 Nemotron-H MoE architectures end-to-end via a backend backport landed in our
-upstream PR.
+open upstream PR ([ikawrakow/ik_llama.cpp#1593](https://github.com/ikawrakow/ik_llama.cpp/pull/1593)).
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Rust 2021](https://img.shields.io/badge/Rust-2021_edition-orange.svg)](https://www.rust-lang.org)
 [![Backend: ik_llama.cpp](https://img.shields.io/badge/Backend-ik__llama.cpp-green.svg)](https://github.com/AIdevsmartdata/ik_llama.cpp)
 [![CUDA sm_120](https://img.shields.io/badge/CUDA-sm__120-76B900.svg)](https://developer.nvidia.com/cuda-toolkit)
+
+## Why Chimère
+
+- **One 16 GB consumer GPU.** No H100, no cloud, no multi-GPU tricks. RTX 5060 Ti target.
+- **Rust end-to-end.** Single `chimere-server` binary, axum 0.8, OpenAI-compatible API.
+- **Engram n-gram logit bias.** A per-token personalisation overlay we believe is unique — see [Features](#features).
+- **Multi-architecture dispatch.** One trait, two impls: Qwen3.5 full stack *and* the Mamba-2 / Nemotron-H family.
+- **TurboQuant-flavoured K-cache.** Hadamard-rotated keys, Q8_0/Q4_0 KV, free ~8 % tok/s.
+
+## The Chimère family
+
+| Repo | Role | Link |
+|---|---|---|
+| **chimere** (this repo) | Rust inference runtime | you are here |
+| **chimere-odo** | Python orchestrator: intent routing, deep-search, quality gate | <https://github.com/AIdevsmartdata/chimere-odo> |
+| **chimere-studio** | Tauri 2 desktop / mobile UI | <https://github.com/AIdevsmartdata/chimere-studio> |
+| **ramp-quant** | RAMP / TQ3 mixed-precision quant pipeline | <https://github.com/AIdevsmartdata/ramp-quant> |
+| **ik_llama.cpp** fork | Backend C++/CUDA kernels, Mamba-2 + Nemotron-H backport | <https://github.com/AIdevsmartdata/ik_llama.cpp> |
+| **GGUF model weights** | Distilled, RAMP, IQ3_S custom mixes | <https://huggingface.co/Kevletesteur> |
+
+> TL;DR benchmark: **94 tok/s** on Qwen3.5-35B-A3B (TQ3 custom mix, 32 K ctx, 13 GB VRAM used) — see [benchmarks/](benchmarks/) and the [public benchmark note](https://github.com/AIdevsmartdata/chimere/blob/main/benchmarks/benchmark-qwen35-2026-03-07.md).
 
 ---
 
