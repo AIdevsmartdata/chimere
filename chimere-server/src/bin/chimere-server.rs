@@ -38,6 +38,7 @@ use chimere_deltanet::generic_model::GenericModel;
 use chimere_deltanet::gguf_loader::GgufFile;
 use chimere_deltanet::qwen35_model::Qwen35Model;
 use chimere_deltanet::server::{AppState, AppStateModel, build_router};
+use chimere_deltanet::slot_scheduler::{Scheduler, SchedulerConfig};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
@@ -298,6 +299,38 @@ async fn main() {
         .ok().and_then(|s| s.parse().ok()).unwrap_or(4);
     eprintln!("[chimere-server] AgentScheduler: max_agents={}", max_agents);
 
+    // ---------------------------------------------------------------------
+    // M1 J2: multi-slot scheduler (optional). The scheduler is built iff
+    // `CHIMERE_MULTISLOT` is explicitly set to a value >= 2. Otherwise
+    // `AppState.scheduler = None` and the HTTP handlers take the legacy
+    // direct-`thread::spawn` path — production behaviour is unchanged.
+    //
+    // When built, we spawn the dispatcher OS thread here so the admission
+    // channel is live before the axum listener starts accepting requests.
+    // The JoinHandles are leaked on purpose (process-lifetime workers).
+    // ---------------------------------------------------------------------
+    let scheduler_cfg = SchedulerConfig::from_env();
+    let scheduler_arc: Option<Arc<Scheduler>> = if scheduler_cfg.is_active() {
+        eprintln!(
+            "[chimere-server] M1 multi-slot ENABLED: num_slots={}, queue_cap={} (CHIMERE_MULTISLOT)",
+            scheduler_cfg.num_slots, scheduler_cfg.queue_cap,
+        );
+        let mut sched = Scheduler::new(scheduler_cfg);
+        let handles = sched.spawn_workers();
+        let sched_arc = Arc::new(sched);
+        // Detach the dispatcher JoinHandle — it lives for the process.
+        for h in handles {
+            std::mem::forget(h);
+        }
+        Some(sched_arc)
+    } else {
+        eprintln!(
+            "[chimere-server] M1 multi-slot disabled (CHIMERE_MULTISLOT unset or =1). \
+             Using legacy single-slot path."
+        );
+        None
+    };
+
     let state = Arc::new(AppState {
         model: Mutex::new(app_model),
         tokenizer,
@@ -305,6 +338,7 @@ async fn main() {
         agent_scheduler: Mutex::new(chimere_deltanet::agent_scheduler::AgentScheduler::new(max_agents)),
         user_agent_map: Mutex::new(std::collections::HashMap::new()),
         max_agents,
+        scheduler: scheduler_arc,
     });
 
     let app = build_router(state);

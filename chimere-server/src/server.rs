@@ -43,6 +43,7 @@ use crate::generate::{generate_text, generate_text_generic};
 use crate::generic_model::GenericModel;
 use crate::mtp_scheduler::{SamplingParams, generate_with_mtp_streaming};
 use crate::qwen35_model::Qwen35Model;
+use crate::slot_scheduler::{ScheduledRequest, ScheduledRequestMeta, Scheduler};
 use crate::state::GdnRecurrentState;
 
 // ---------------------------------------------------------------------------
@@ -318,6 +319,21 @@ pub struct AppState {
     pub user_agent_map: Mutex<std::collections::HashMap<String, usize>>,
     /// Max agents (from env CHIMERE_MAX_AGENTS, default 4).
     pub max_agents: usize,
+    /// M1 J2 multi-slot scheduler. `None` in legacy single-slot mode
+    /// (the default when `CHIMERE_MULTISLOT` is unset or `1`). When `Some`,
+    /// HTTP handlers route the inference closure through the admission
+    /// queue instead of spawning the compute thread directly.
+    ///
+    /// The scheduler is armed at process startup in
+    /// `bin/chimere-server.rs` and lives for the process lifetime.
+    pub scheduler: Option<Arc<Scheduler>>,
+}
+
+impl AppState {
+    /// `true` when the multi-slot admission path is enabled.
+    pub fn multislot_active(&self) -> bool {
+        self.scheduler.as_ref().map(|s| s.is_active()).unwrap_or(false)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -867,75 +883,101 @@ fn packed_to_logprob_content(packed: &[f32], tokenizer: &Tokenizer, max_top: usi
     }
 }
 
-async fn chat_completions_stream(
+/// Arguments packed into a single struct so the inference worker can be
+/// called from both the legacy path (direct `thread::spawn`) and the M1
+/// scheduler path (closure captured in `ScheduledRequest::run`).
+///
+/// Every field is owned so the struct can be moved across threads.
+struct InferenceArgs {
+    prompt: String,
+    max_tokens: usize,
+    params: SamplingParams,
+    enable_thinking: bool,
+    want_logprobs: bool,
+    top_logprobs_n: usize,
+}
+
+/// The exact body that used to live inline inside the `thread::spawn`
+/// closure of `chat_completions_stream`. Extracted verbatim so both the
+/// legacy single-slot path and the J2 scheduler path can reuse it.
+///
+/// Blocking: this function uses `blocking_lock()` / `blocking_send()` and
+/// must run on a dedicated OS thread (NOT a tokio task). Both callers
+/// wrap it in `std::thread::spawn`.
+fn run_streaming_inference_worker(
     state: Arc<AppState>,
-    req: ChatRequest,
-) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
-    let model_name = state.model_name.clone();
-    let req_id = new_request_id();
-    let created = unix_now();
+    tokenizer: Arc<Tokenizer>,
+    tx: tokio::sync::mpsc::Sender<StreamMsg>,
+    args: InferenceArgs,
+) {
+    let InferenceArgs {
+        prompt,
+        max_tokens,
+        params,
+        enable_thinking,
+        want_logprobs,
+        top_logprobs_n,
+    } = args;
 
-    let enable_thinking = req.chat_template_kwargs
-        .as_ref()
-        .map(|k| k.enable_thinking)
-        .unwrap_or(true);
-    let prompt = messages_to_prompt(&req.messages, req.tools.as_ref(), enable_thinking);
-    let max_tokens = req.max_tokens.min(MAX_TOKENS_LIMIT);
-    let params = SamplingParams {
-        temperature: req.temperature,
-        top_p: req.top_p,
-        top_k: req.top_k,
-        min_p: 0.05,
-        repetition_penalty: req.repetition_penalty.unwrap_or(1.0) as f32,
-        presence_penalty: req.presence_penalty as f32,
-        dry_multiplier: 0.8,
-        dry_base: 1.75,
-        dry_min_length: 2,
-        dry_penalty_last_n: -1,
-    };
-
-    // Capture logprobs settings before moving req.
-    let want_logprobs = req.logprobs;
-    let top_logprobs_n = req.top_logprobs.unwrap_or(5).min(5); // FFI max is 5
-
-    // Channel for streaming tokens from inference thread to SSE stream.
-    // Buffer of 128 — inference produces ~57 tok/s, SSE consumes faster.
-    let (tx, rx) = tokio::sync::mpsc::channel::<StreamMsg>(128);
-
-    // Clone what we need for the spawned thread.
-    let state_clone = Arc::clone(&state);
-    let tokenizer_clone = Arc::clone(&state.tokenizer);
-
-    // Spawn inference on a dedicated OS thread (NOT tokio::spawn) so we can
-    // use blocking_lock() and blocking_send() without deadlocking the runtime.
-    std::thread::spawn(move || {
-        // Encode prompt tokens.
-        let prompt_ids = match tokenizer_clone.encode(prompt.as_str(), false) {
-            Ok(enc) => enc.get_ids().to_vec(),
-            Err(e) => {
-                let _ = tx.blocking_send(StreamMsg::Done(Some(format!("Tokenizer encode failed: {}", e))));
-                return;
-            }
-        };
-
-        if prompt_ids.is_empty() {
-            let _ = tx.blocking_send(StreamMsg::Done(Some("Prompt encoded to zero tokens".into())));
+    // Encode prompt tokens.
+    let prompt_ids = match tokenizer.encode(prompt.as_str(), false) {
+        Ok(enc) => enc.get_ids().to_vec(),
+        Err(e) => {
+            let _ = tx.blocking_send(StreamMsg::Done(Some(format!("Tokenizer encode failed: {}", e))));
             return;
         }
+    };
 
-        // Lock the model (blocking — we're on a dedicated OS thread).
-        let model = state_clone.model.blocking_lock();
+    if prompt_ids.is_empty() {
+        let _ = tx.blocking_send(StreamMsg::Done(Some("Prompt encoded to zero tokens".into())));
+        return;
+    }
 
-        // Per-arch dispatch. The Qwen path is byte-for-byte identical to
-        // the pre-Step-7 implementation (only re-indented inside a match
-        // arm). The Generic path is a non-streaming wrapper — it runs
-        // generate_text_generic and emits the whole text as a single
-        // Token message followed by Done. SSE consumers see one event
-        // with the full content; this matches OpenAI behaviour for
-        // models that do not stream natively. Replacing this with a
-        // proper token-by-token Generic streaming loop is a Step 7.5
-        // ticket.
-        match &*model {
+    // Lock the model (blocking — we're on a dedicated OS thread).
+    let model = state.model.blocking_lock();
+
+    // Per-arch dispatch body (identical to pre-J2). Rebound locals to the
+    // names the original code expected.
+    let state_clone = &state;
+    let tokenizer_clone = &tokenizer;
+    run_streaming_inference_body(
+        state_clone,
+        tokenizer_clone,
+        &tx,
+        &prompt_ids,
+        max_tokens,
+        &params,
+        enable_thinking,
+        want_logprobs,
+        top_logprobs_n,
+        &model,
+    );
+    drop(model);
+    // tx is dropped here, closing the per-request channel.
+}
+
+/// Inner helper — the per-arch dispatch. Split out of
+/// `run_streaming_inference_worker` so the top-level function stays flat.
+#[allow(clippy::too_many_arguments)]
+fn run_streaming_inference_body(
+    state_clone: &Arc<AppState>,
+    tokenizer_clone: &Arc<Tokenizer>,
+    tx: &tokio::sync::mpsc::Sender<StreamMsg>,
+    prompt_ids: &[u32],
+    max_tokens: usize,
+    params: &SamplingParams,
+    enable_thinking: bool,
+    want_logprobs: bool,
+    top_logprobs_n: usize,
+    model: &AppStateModel,
+) {
+    let _ = state_clone; // unused here; reserved for future per-slot routing
+
+    // Per-arch dispatch. The Qwen path is byte-for-byte identical to
+    // the pre-Step-7 / pre-J2 implementation. The Generic path is a
+    // non-streaming wrapper — it runs generate_text_generic and emits
+    // the whole text as a single Token message followed by Done.
+    match &*model {
             AppStateModel::Qwen35(qwen) => {
                 // Reset state for the active backend (llama or cudarc).
                 qwen.reset_llama_state();
@@ -1060,8 +1102,155 @@ async fn chat_completions_stream(
                 }
             }
         }
-        // tx is dropped here, closing the channel.
-    });
+        // end of per-arch dispatch; caller drops `tx` when this helper returns.
+}
+
+/// Decide between the J2 scheduler path and the legacy direct-spawn path,
+/// then dispatch the inference so the caller can focus on SSE plumbing.
+///
+/// Behaviour
+/// - If `state.scheduler` is `Some(s)` and `s.is_active()`, we build a
+///   `ScheduledRequest { run: Box<dyn FnOnce>, metadata }` and `.send()`
+///   it on the admission channel. The dispatcher thread picks it up and
+///   invokes `run`, which spawns the compute OS thread.
+/// - Otherwise (legacy default when `CHIMERE_MULTISLOT` is unset or `1`),
+///   we spawn the compute OS thread directly, identical to the pre-J2
+///   behaviour.
+///
+/// This function is async only because the scheduler's admission channel
+/// `send` is async (bounded, backpressure). In legacy mode it returns
+/// immediately after spawning the thread — no `.await` needed but we keep
+/// the signature uniform for the caller.
+async fn dispatch_streaming_inference(
+    state: Arc<AppState>,
+    tx: tokio::sync::mpsc::Sender<StreamMsg>,
+    args: InferenceArgs,
+    request_id: String,
+) {
+    // Clone what the closure captures before we decide which branch to take.
+    let tokenizer = Arc::clone(&state.tokenizer);
+    let prompt_token_count = tokenizer
+        .encode(args.prompt.as_str(), false)
+        .map(|e| e.len())
+        .unwrap_or(0);
+    let max_tokens_u32 = args.max_tokens.min(u32::MAX as usize) as u32;
+
+    match state.scheduler.as_ref() {
+        Some(sched) if sched.is_active() => {
+            // J2 path: admission queue → dispatcher → spawn compute thread.
+            let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let metadata = ScheduledRequestMeta {
+                request_id: request_id.clone(),
+                prompt_token_count,
+                max_tokens: max_tokens_u32,
+                cancelled: Arc::clone(&cancelled),
+                enqueued_at: std::time::Instant::now(),
+            };
+            let tx_for_closure = tx.clone();
+            let state_for_closure = Arc::clone(&state);
+            let tokenizer_for_closure = Arc::clone(&tokenizer);
+            let run: Box<dyn FnOnce(ScheduledRequestMeta) + Send + 'static> =
+                Box::new(move |_meta: ScheduledRequestMeta| {
+                    // IMPORTANT: spawn a dedicated OS thread so the scheduler
+                    // dispatcher is not blocked by long generations. The
+                    // compute thread owns its captures until it exits.
+                    std::thread::Builder::new()
+                        .name("chimere-inf".into())
+                        .spawn(move || {
+                            run_streaming_inference_worker(
+                                state_for_closure,
+                                tokenizer_for_closure,
+                                tx_for_closure,
+                                args,
+                            );
+                        })
+                        .expect("failed to spawn chimere-inf thread");
+                });
+
+            let admission_tx = sched.admission_tx();
+            let scheduled = ScheduledRequest { metadata, run };
+            if let Err(_e) = admission_tx.send(scheduled).await {
+                // Admission channel closed (scheduler dropped). Fallback: the
+                // caller's `tx` stays open; send a Done(err). Never panic.
+                let _ = tx
+                    .send(StreamMsg::Done(Some(
+                        "Scheduler admission channel closed — server shutdown?".into(),
+                    )))
+                    .await;
+            }
+        }
+        _ => {
+            // Legacy path: spawn the compute thread directly.
+            std::thread::Builder::new()
+                .name("chimere-inf-legacy".into())
+                .spawn(move || {
+                    run_streaming_inference_worker(state, tokenizer, tx, args);
+                })
+                .expect("failed to spawn chimere-inf-legacy thread");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/chat/completions — streaming (SSE) path (continued)
+//
+// J2 addition: when `state.scheduler` is armed (CHIMERE_MULTISLOT >= 2),
+// the inference is enqueued on the admission channel and executed from the
+// scheduler dispatcher thread. When the scheduler is not armed, the legacy
+// path still spawns a dedicated OS thread directly. In both cases the
+// compute body is `run_streaming_inference_worker`.
+// ---------------------------------------------------------------------------
+
+async fn chat_completions_stream(
+    state: Arc<AppState>,
+    req: ChatRequest,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let model_name = state.model_name.clone();
+    let req_id = new_request_id();
+    let created = unix_now();
+
+    let enable_thinking = req.chat_template_kwargs
+        .as_ref()
+        .map(|k| k.enable_thinking)
+        .unwrap_or(true);
+    let prompt = messages_to_prompt(&req.messages, req.tools.as_ref(), enable_thinking);
+    let max_tokens = req.max_tokens.min(MAX_TOKENS_LIMIT);
+    let params = SamplingParams {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        top_k: req.top_k,
+        min_p: 0.05,
+        repetition_penalty: req.repetition_penalty.unwrap_or(1.0) as f32,
+        presence_penalty: req.presence_penalty as f32,
+        dry_multiplier: 0.8,
+        dry_base: 1.75,
+        dry_min_length: 2,
+        dry_penalty_last_n: -1,
+    };
+
+    // Capture logprobs settings before moving req.
+    let want_logprobs = req.logprobs;
+    let top_logprobs_n = req.top_logprobs.unwrap_or(5).min(5); // FFI max is 5
+
+    // Channel for streaming tokens from inference thread to SSE stream.
+    // Buffer of 128 — inference produces ~57 tok/s, SSE consumes faster.
+    let (tx, rx) = tokio::sync::mpsc::channel::<StreamMsg>(128);
+
+    // Dispatch: scheduler path when active, legacy thread::spawn otherwise.
+    dispatch_streaming_inference(
+        Arc::clone(&state),
+        tx,
+        InferenceArgs {
+            prompt,
+            max_tokens,
+            params,
+            enable_thinking,
+            want_logprobs,
+            top_logprobs_n,
+        },
+        req_id.clone(),
+    )
+    .await;
 
     // Build the SSE stream from the channel receiver using futures::stream::unfold.
     // The unfold state tracks: receiver, request metadata, and phase flags.
