@@ -13,24 +13,29 @@
 #include <algorithm>
 
 // ---------------------------------------------------------------------------
-// ik_llama grammar-apply shim (M1 J3, 2026-04-24)
+// ik_llama grammar-apply shim (M1 J3, 2026-04-24 / updated J4)
 // ---------------------------------------------------------------------------
 // libcommon's sampling.cpp references llama_grammar_apply which is part of the
 // upstream llama.cpp grammar API but NOT exposed by ik_llama's libllama.
 // Chimère does not use grammar-constrained sampling (we use chimere_sampler,
-// not common_sampler's grammar path), so the symbol is never actually invoked
-// at runtime. We provide an abort-stub just to satisfy the linker for binaries
-// like j3-smoke that drag in the full libcommon.a.
+// not common_sampler's grammar path), so calling `grammar_apply` on our
+// null grammar is a safe no-op.
 //
-// If this is ever hit, something drastically changed — fail loud.
+// The J3 version of this shim called `std::abort()` in the belief the symbol
+// was dead code. In practice common_sampler_init wires a grammar sampler into
+// its chain even with an empty grammar string, and the chain may route
+// through this symbol during init on a rebuilt libcommon (observed on
+// 2026-04-24 09:36 rebuild of `libcommon.a`). The abort was crashing BOTH
+// j4-smoke/j5-smoke AND fresh `chimere-server` rebuilds at sampler init.
+//
+// Behaviour now: silently return. `chimere_sampler_sample_with_logprobs`
+// and `chimere_sampler_sample` never consult the grammar on our path;
+// the no-op is safe as long as nobody sets a non-empty grammar string.
 struct llama_grammar;
 struct llama_token_data_array;
 extern "C" void llama_grammar_apply(struct llama_grammar * /*grammar*/,
                                     struct llama_token_data_array * /*candidates*/) {
-    std::fprintf(stderr,
-        "FATAL: llama_grammar_apply called but ik_llama does not export it.\n"
-        "Chimère does not use grammar-constrained sampling. Check caller.\n");
-    std::abort();
+    // No-op: Chimère does not use grammar-constrained sampling.
 }
 
 extern "C" {
