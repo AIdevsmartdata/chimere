@@ -1987,13 +1987,15 @@ mod tests {
         let cfg_legacy = SchedulerConfig {
             num_slots: 1, queue_cap: 4, enabled: false, native: false,
         };
-        let err = NativeScheduler::new(cfg_legacy, None, 0.8).unwrap_err();
+        let err = NativeScheduler::new(cfg_legacy, None, 0.8)
+            .err().expect("expected Err for legacy config");
         assert!(err.contains("CHIMERE_MULTISLOT"));
 
         let cfg_j2_only = SchedulerConfig {
             num_slots: 2, queue_cap: 4, enabled: true, native: false,
         };
-        let err = NativeScheduler::new(cfg_j2_only, None, 0.8).unwrap_err();
+        let err = NativeScheduler::new(cfg_j2_only, None, 0.8)
+            .err().expect("expected Err for j2-only config");
         assert!(err.contains("native="));
     }
 
