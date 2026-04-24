@@ -339,6 +339,10 @@ async fn main() {
         user_agent_map: Mutex::new(std::collections::HashMap::new()),
         max_agents,
         scheduler: scheduler_arc,
+        // M1 J4-rewrite: NativeScheduler is opt-in via CHIMERE_MULTISLOT_NATIVE=1.
+        // When disabled (prod default), stays None and all requests take the
+        // legacy `Mutex<AppStateModel>` path.
+        native_scheduler: None,
     });
 
     let app = build_router(state);
