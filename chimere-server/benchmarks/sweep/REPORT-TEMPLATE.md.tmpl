@@ -1,0 +1,87 @@
+# chimere-server sweep-bench report
+
+Start: {{START_ISO}}
+End: {{END_ISO}}
+Git SHA: `{{GIT_SHA}}` (chimere-server repo at {{SERVER_ROOT}})
+Cells: {{N_CELLS}}
+
+---
+
+## 1. Setup
+
+- Model: `{{MODEL_PATH}}` (quant: `{{MODEL_QUANT}}`)
+- Hardware: {{GPU}}, driver {{DRIVER}}, CUDA {{CUDA}}
+- Runtime: chimere-server Rust FFI + ik_llama.cpp sm_120 backend, native multi-slot scheduler (CHIMERE_MULTISLOT_NATIVE=1), streaming-only (CHIMERE_SKIP_LEGACY_LLAMA=1), LLAMA_SET_ROWS=1.
+- Knobs swept:
+  - CHIMERE_MULTISLOT in `{{MULTISLOT_SWEEP}}`
+  - CHIMERE_NCMOE in `{{NCMOE_SWEEP}}`
+  - CHIMERE_MAX_PREFILL_CHUNK in `{{PREFILL_CHUNK_SWEEP}}`
+- Per cell: {{N_REQS_PER_PASS}} streaming requests at concurrency min(M, 8), max_tokens={{MAX_TOKENS}}, prompt bank `{{PROMPT_SET}}` (round-robin across 4 canonical prompts of varied length).
+
+## 2. Methodology
+
+For each cell of the grid:
+
+1. Launch a fresh chimere-server child process on the bench port (not :8081 prod). Wait for /health (up to 180 s, model load is 30-60 s).
+2. Snapshot /metrics and /v1/status pre-pass.
+3. Launch `nvidia-smi dmon -s pumct -d 1 -c 1200 -o T` concurrently.
+4. Drive {{N_REQS_PER_PASS}} concurrent streaming requests through the existing stream_bench.py driver (TTFT = arrival of first SSE delta with non-empty content or reasoning_content, inter-token gap = wall-time between consecutive deltas).
+5. Snapshot /metrics and /v1/status post-pass.
+6. Stop the server (SIGTERM, 20 s grace, then SIGKILL).
+7. Wait 3 s for GPU VRAM release before the next cell.
+
+Aggregations are computed from the driver's per-request JSONL (raw-<cell>.jsonl) and the nvidia-smi dmon CSV. Quantiles are computed on the pooled sample (all requests x all tokens for inter-token distributions).
+
+VRAM column is a single-shot `nvidia-smi` query at end-of-pass, so MiB used reflects model weights + KV cache + activation pools at the moment the pass finished. Good enough for sweet-spot ranking, not publication-grade.
+
+## 3. Grid results
+
+{{TABLE_GRID}}
+
+## 4. TTFT and inter-token distribution
+
+{{TABLE_TTFT}}
+
+## 5. VRAM and GPU utilization
+
+{{TABLE_VRAM}}
+
+## 6. Sweet-spot
+
+{{SWEET_SPOT}}
+
+Ranking is a simple utility `agg_tok_per_s - 0.1 * ttft_p99_ms - 0.02 * vram_mib` that favours high aggregate throughput, tight tails, and low memory pressure. Adjust the weights in render_report.py::pick_sweet_spot if the deployment has different priorities (e.g. TTFT-dominated user UX, larger TTFT penalty).
+
+## 7. Reproduction
+
+```bash
+{{REPRO_COMMAND}}
+```
+
+Raw artifacts live in `{{OUTPUT_DIR}}/raw/` (one directory per cell) and `{{OUTPUT_DIR}}/logs/` (chimere-server stderr, driver stderr). The CSV source of this report is `{{OUTPUT_DIR}}/sweep.csv` and can be re-rendered with:
+
+```bash
+python3 render_report.py \
+    --csv   {{OUTPUT_DIR}}/sweep.csv \
+    --template REPORT-TEMPLATE.md.tmpl \
+    --output {{OUTPUT_DIR}}/REPORT.md \
+    --start "{{START_ISO}}" --end "{{END_ISO}}" \
+    --git-sha "{{GIT_SHA}}" \
+    --server-root "{{SERVER_ROOT}}" \
+    --output-dir "{{OUTPUT_DIR}}" \
+    --model-path "{{MODEL_PATH}}" \
+    --multislot-sweep "{{MULTISLOT_SWEEP}}" \
+    --ncmoe-sweep "{{NCMOE_SWEEP}}" \
+    --prefill-chunk-sweep "{{PREFILL_CHUNK_SWEEP}}" \
+    --n-reqs-per-pass "{{N_REQS_PER_PASS}}" \
+    --max-tokens "{{MAX_TOKENS}}" \
+    --prompt-set "{{PROMPT_SET}}"
+```
+
+## 8. Caveats
+
+- Small N per cell. At {{N_REQS_PER_PASS}} requests/cell, TTFT p99 has sample size N. Good enough for ranking; not publication-grade. Bump --n-requests-per-pass for tighter error bars.
+- One GPU, one model, one quant. Generalization to other quants or hybrids not measured by this sweep.
+- Cold-start dominates for short-lived cells. The 30-60 s model load per cell is not included in per-cell wall_s (the pass clock only starts after /health returns). The harness itself takes ~60-90 s per cell end-to-end.
+- VRAM measurement is single-shot nvidia-smi at pass end, no peak tracking. The dmon CSV has BW-util (%), not MiB. Use the existing run-bench.sh + external VRAM monitoring if a peak is required.
+- Native streaming only. At CHIMERE_MULTISLOT_NATIVE=1, non-streaming requests return HTTP 400 (native_mode_streaming_only). The driver uses streaming exclusively.

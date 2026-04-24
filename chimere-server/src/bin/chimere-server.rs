@@ -31,6 +31,7 @@
 //! | `CHIMERE_MULTISLOT`| `1`                                                                    | Number of scheduler slots (>=2 arms J2) |
 //! | `CHIMERE_MULTISLOT_NATIVE` | (unset)                                                        | Set to `1` with `CHIMERE_MULTISLOT>=2` to arm the J4-rewrite NativeScheduler |
 //! | `CHIMERE_NATIVE_ENGRAM_ALPHA` | `0.0`                                                       | Default engram bias alpha used by NativeScheduler when request does not override |
+//! | `CHIMERE_MAX_PREFILL_CHUNK` | `256`                                                          | Native scheduler: max prompt tokens per `forward_multi_seq` prefill tick (alias of `CHIMERE_NATIVE_MAX_PREFILL_CHUNK`) |
 //! | `CHIMERE_SKIP_LEGACY_LLAMA` | (unset)                                                       | Set to `1` to skip the legacy `Qwen35Model::init_llama_forward` when NativeScheduler is armed (saves ~KV cache VRAM) |
 //!
 //! # Observability

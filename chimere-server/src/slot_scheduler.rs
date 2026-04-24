@@ -1237,9 +1237,20 @@ impl NativeScheduler {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let max_prefill_chunk: usize = std::env::var("CHIMERE_NATIVE_MAX_PREFILL_CHUNK")
+        // Operator-facing alias. `CHIMERE_MAX_PREFILL_CHUNK` is the preferred
+        // name (shorter, listed in bin/chimere-server.rs env-var table). The
+        // legacy `CHIMERE_NATIVE_MAX_PREFILL_CHUNK` is kept as a fallback so
+        // existing systemd units and tests stay bit-identical.
+        //
+        // Precedence: CHIMERE_MAX_PREFILL_CHUNK > CHIMERE_NATIVE_MAX_PREFILL_CHUNK > 256.
+        let max_prefill_chunk: usize = std::env::var("CHIMERE_MAX_PREFILL_CHUNK")
             .ok()
-            .and_then(|s| s.parse().ok())
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .or_else(|| {
+                std::env::var("CHIMERE_NATIVE_MAX_PREFILL_CHUNK")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<usize>().ok())
+            })
             .unwrap_or(256);
 
         eprintln!(

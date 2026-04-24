@@ -1,0 +1,141 @@
+# Canonical prompt bank for sweep-bench.sh
+#
+# Each entry is a (label, prompt) pair. The harness round-robins through
+# the bank for each request within a cell. When multiple prompts are
+# shipped, the aggregate stats cover a spread of prefill sizes rather
+# than a single point — useful because prefill cost dominates TTFT at
+# small M and is O(1) per-layer for GDN but O(ctx) per-layer for the
+# 10 full-attention layers.
+#
+# Token counts are ballpark estimates for the Qwen3.5/3.6 tokenizer
+# (roughly 1.3-1.5 tokens per English word). Actual counts are logged
+# by the server in /metrics (chimere_prompt_tokens_total).
+#
+# Mix:
+#   - short (~10-20 tok) — exercises the "mostly decode" regime
+#   - medium (~350-500 tok) — exercises prefill work per-request
+#   - long (~1800-2200 tok) — exercises the full-attention layers
+#   - code — distinct token distribution (exercises tokenizer merges
+#     differently; useful to catch sampler regressions)
+#
+# Schema (parsed by sweep-bench.sh / driver_wrapper.py):
+#   prompts:
+#     - label: <str>      # used in output filenames
+#       approx_tokens: <int>
+#       text: |            # multi-line prompt, trimmed on load
+#         <prompt text>
+
+prompts:
+  - label: short-eiffel
+    approx_tokens: 12
+    text: |
+      Write one short sentence about the Eiffel Tower.
+
+  - label: medium-hybrid
+    approx_tokens: 420
+    text: |
+      You are a staff engineer reviewing a proposal for a new LLM serving
+      stack. The proposal advocates a hybrid architecture: 30 layers of
+      Gated Delta Networks (recurrent state-space blocks, O(1) memory
+      per token) interleaved with 10 layers of full self-attention
+      (O(ctx) memory per token, but global receptive field). The mixture
+      of experts routes 8 experts per token out of a pool of 128, with
+      roughly 3 billion parameters active per forward pass on a 35
+      billion total model.
+
+      Questions for your review, each answered in 2-3 sentences:
+      (1) What class of inference workload benefits most from this
+      hybrid split, and why does the GDN-heavy share save memory
+      bandwidth at long context?
+      (2) Why is batching across requests harder for the GDN layers
+      than for the full-attention layers, and what does that imply
+      for multi-slot scheduling?
+      (3) If you had to give up one of the three — GDN ratio, MoE
+      sparsity, or flash-attention on the dense layers — which would
+      you keep, for a 16 GB consumer GPU target, and in one sentence
+      why.
+
+  - label: long-quant-survey
+    approx_tokens: 1900
+    text: |
+      Write a thorough, technical, three-paragraph survey of the trade-offs
+      between 3-bit and 4-bit weight-only quantization for large language
+      models targeted at consumer-grade inference on GPUs with 16-24 GB of
+      VRAM. Cover the following points explicitly and concretely, with
+      numbers where you remember them and honest "I do not remember the
+      exact figure" where you do not:
+
+      Paragraph 1 — Theory and method families.
+      Begin with the distinction between per-tensor, per-channel, and
+      per-group scales, and explain why k-quant formats (IQ3_S, IQ4_XS,
+      Q4_K_M) ship grouped scales with 256-element blocks. Discuss how
+      importance matrices (imatrix) are computed, how many tokens are
+      typically used (100k? 1M?), and what the "GPTQ vs AWQ vs SpinQuant
+      vs QuaRot" lineage looks like as of early 2026. Say one sentence
+      on why QuaRot's rotation trick is fundamentally incompatible with
+      recurrent state-space (Mamba-2, GDN) layers and what this means
+      for hybrid stacks. Do not hedge; if you are uncertain about a
+      method's status on hybrid, say so.
+
+      Paragraph 2 — Empirical trade-offs.
+      Summarize the typical perplexity gap between BF16 and Q4_K_M for
+      a 30B-scale MoE at the 32k context, between BF16 and IQ3_S, and
+      between IQ3_S and the custom-quant pipelines (tensor-type overrides
+      on embeddings + attention). Give one specific example from the
+      literature or from a reputable GGUF release note. Then discuss
+      how 3-bit quantization degrades in particular on: (a) low-frequency
+      tokens in the embedding matrix, (b) the attention output
+      projection, (c) routing weights in MoE. State which of these three
+      is typically most damaging and how operators mitigate it (usually
+      via per-tensor Q8_0/Q6_K overrides for the offending tensors).
+      Close with a sentence on why 3-bit is "good enough" for the
+      bandwidth-bound regime on a consumer GPU.
+
+      Paragraph 3 — Forward look.
+      Briefly cover the direction of research in early 2026: ParoQuant
+      on GDN/SSM (what it tries to do, why it needs an A100-class GPU
+      to calibrate, why the resulting GGUF shape is transposed relative
+      to k-quant), OptRot's per-matrix rotation that is "garbage without
+      absorption", and TurboQuant's KV-cache Hadamard (`-khad`) that
+      beat TQ3 by 4.8x on dense-attention stacks but is not needed for
+      hybrid architectures where the KV cache is small anyway. End with
+      one sentence on whether the field is converging toward "3-bit is
+      the new 4-bit" for consumer inference, and what would need to be
+      true for "2-bit is the new 3-bit" to hold.
+
+      Format: three paragraphs, no preamble, no headings, no bulleted
+      lists. Keep it technical; assume the reader knows what a GGUF
+      tensor is and what a fused matmul is. Do not explain what
+      quantization is from scratch.
+
+  - label: code-refactor
+    approx_tokens: 380
+    text: |
+      Refactor the following Rust function to remove the unwrap() and
+      return a Result instead. Preserve the function's public signature
+      shape — callers still pass a &str path, still get back a usize —
+      but they should now get a descriptive error on the three failure
+      modes (file missing, header magic wrong, truncated tensor list).
+      Use `String` for errors (not a custom enum), keep the function
+      non-async, and do NOT pull in a new crate.
+
+      ```rust
+      /// Open a GGUF file and return the number of tensors it declares
+      /// in its header. Panics on any I/O or format error.
+      pub fn count_tensors(path: &str) -> usize {
+          let mut f = std::fs::File::open(path).unwrap();
+          let mut magic = [0u8; 4];
+          std::io::Read::read_exact(&mut f, &mut magic).unwrap();
+          assert_eq!(&magic, b"GGUF");
+          let mut n_bytes = [0u8; 8];
+          let pos = std::io::Seek::seek(&mut f, std::io::SeekFrom::Start(12)).unwrap();
+          assert_eq!(pos, 12);
+          std::io::Read::read_exact(&mut f, &mut n_bytes).unwrap();
+          u64::from_le_bytes(n_bytes) as usize
+      }
+      ```
+
+      Deliver the refactored function ready to paste into a .rs file,
+      plus one unit-style "smoke test" (three `#[test]` functions in a
+      `#[cfg(test)]` mod). No explanation prose around the code — just
+      the code blocks.
