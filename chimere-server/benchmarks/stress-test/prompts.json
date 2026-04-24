@@ -1,0 +1,30 @@
+[
+  {
+    "id": "piege-logique-bateau",
+    "trap_type": "logique/physique (piège classique)",
+    "prompt": "Un bateau est amarré au port. Sur le côté du bateau pend une échelle de 20 barreaux. Chaque barreau est espacé de 30 cm. La marée monte de 50 cm par heure. Au bout de 3 heures, combien de barreaux sont sous l'eau ? Raisonne étape par étape.",
+    "expected_answer": "0 barreau : le bateau flotte et monte AVEC la marée, donc l'échelle reste à la même distance de l'eau. C'est un piège classique de raisonnement physique.",
+    "quality_criteria": ["identifie le piège (bateau flotte)", "réponse 0", "explication claire"]
+  },
+  {
+    "id": "piege-code-voyelles-fr",
+    "trap_type": "code avec edge case (charset francais)",
+    "prompt": "Écris une fonction Python 3 nommée `count_voyelles(texte: str) -> int` qui compte les voyelles dans une chaîne en français. Inclus un exemple d'usage avec un dictionnaire doctest. Le test doit inclure le mot 'éléphant' qui doit retourner 3 voyelles.",
+    "expected_answer": "Doit gérer les accents é è à ê ë î ï ô ö û ü y ainsi que a e i o u (case-insensitive). 'éléphant' = é é a = 3. Naif ('aeiouy') retournerait 1 (le 'a'), faux.",
+    "quality_criteria": ["inclut accents français", "case-insensitive", "doctest propre", "éléphant = 3"]
+  },
+  {
+    "id": "piege-medical-entorse-grade3",
+    "trap_type": "précision domaine expert (kiné/médical)",
+    "prompt": "Je suis kinésithérapeute. Un patient arrive avec une entorse grade 3. Quelle est la différence de protocole de rééducation semaine 1-2 entre LCA (ligament croisé antérieur) et LLI (ligament latéral interne) ? Sois précis sur la mise en charge, les amplitudes articulaires autorisées et le contexte chirurgical.",
+    "expected_answer": "LCA grade 3 = rupture complète souvent chirurgicale (ligamentoplastie). En attente chirurgie ou post-op J1-J14 : mise en charge limitée ou protégée selon protocole, amplitudes limitées 0-60° (ou protocole chirurgien), isométrique quad, cryothérapie. LLI grade 3 = rupture complète MAIS traitement souvent conservateur avec genouillère 6 semaines. Mise en charge autorisée sous couvert genouillère, amplitudes progressives. Différence clé = chirurgie LCA vs conservateur LLI.",
+    "quality_criteria": ["distingue LCA=chirurgical vs LLI=conservateur", "mentionne mise en charge", "cite amplitudes articulaires", "contexte attelle/genouillère", "français médical correct"]
+  },
+  {
+    "id": "piege-instruction-strict",
+    "trap_type": "instruction following multi-contraintes",
+    "prompt": "Donne-moi EXACTEMENT 3 conseils pour bien dormir. Chaque conseil doit être une phrase de 10 mots EXACTEMENT, numérotée 1., 2., 3. Après les 3 conseils, termine par le mot 'fin.' en minuscules et rien d'autre. Pas d'intro, pas de conclusion, rien d'autre que ce format.",
+    "expected_answer": "Format attendu : 3 lignes avec exactement 10 mots chacune, puis 'fin.' seule sur la dernière ligne. Pas d'intro, pas de <think> visible, pas de texte supplémentaire.",
+    "quality_criteria": ["exactement 3 conseils numérotés", "chaque conseil ≈ 10 mots (tolérance ±1)", "finit par 'fin.' minuscules", "pas d'intro ni conclusion hors format"]
+  }
+]

@@ -1,0 +1,14 @@
+{
+  "id": "piege-logique-bateau",
+  "trap_type": "logique/physique (piège classique)",
+  "ttft_s": 0.306,
+  "wall_s": 120.011,
+  "content_tokens": 0,
+  "think_chars": 10291,
+  "content_chars": 0,
+  "finish_reason": null,
+  "tok_per_s": 0.0,
+  "prompt_excerpt": "Un bateau est amarré au port. Sur le côté du bateau pend une échelle de 20 barreaux. Chaque barreau est espacé de 30 cm.",
+  "think_excerpt": "Here's a thinking process that leads to the answer:\n\n1.  **Analyze the Riddle:**\n    *   **Context:** A boat is moored at a port.\n    *   **Object:** A ladder hangs from the side of the boat.\n    *   **Dimensions:** 20 rungs, spaced 30 cm apart.\n    *   **Event:** The tide rises at a rate of 50 cm per hour.\n    *   **Time:** 3 hours pass.\n    *   **Question:** How many rungs are underwater after 3 hours?\n\n2.  **Identify the Key Physical Principle:**\n    *   The crucial element here is the relati",
+  "content": ""
+}

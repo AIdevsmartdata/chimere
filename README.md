@@ -65,6 +65,48 @@ open upstream PR ([ikawrakow/ik_llama.cpp#1593](https://github.com/ikawrakow/ik_
 
 ---
 
+## Performance at a glance
+
+Twelve-cell `(M, PCH)` grid on Qwen3.6-35B-A3B IQ3_S, RTX 5060 Ti 16 GB,
+12 streaming requests per cell, `max_tokens=128` — aggregate tokens per
+second across concurrent slots:
+
+| M \ PCH | 256 | 512 | 1024 | 2048 |
+|---:|:---:|:---:|:---:|:---:|
+| **1** | 84.4 | 83.3 | 64.9 [outlier] | 83.2 |
+| **4** | 79.9 | **83.5** | 83.0 | 82.3 |
+| **8** | 81.3 | 81.9 | 91.8 | **92.9** |
+
+Headlines (all numbers read directly from
+[`chimere-server/benchmarks/2026-04-24-multislot-study.md`](chimere-server/benchmarks/2026-04-24-multislot-study.md)
+§8, source CSV `/tmp/chimere-sweep-wide/sweep-merged.csv`, chimere-server
+SHA `e722ff0`):
+
+- **Single-user peak decode:** 98.7 tok/s per slot at M=1.
+- **Production config target (2 to 4 concurrent users):** M=4 / PCH=512,
+  aggregate 83.5 tok/s, TTFT p50 **422 ms** (down from 747 ms at PCH=256),
+  per-slot decode 22.5 tok/s.
+- **Batch workload ceiling:** M=8 / PCH=2048, aggregate 92.9 tok/s —
+  unexpected +11 % over M=4, reported honestly as an empirical observation
+  pending a higher-N rerun.
+
+Multi-slot does not lift aggregate throughput: per-slot decode scales
+as 1/M (98.7 → 22.3 → 14.2 tok/s for M = 1, 4, 8), a signature of the
+GDN serialisation barrier rooted in `ik_llama.cpp/src/llama-delta-net.cpp`
+and analysed in detail in
+[`docs/scheduling-gap-analysis-2026-04-24.md`](docs/scheduling-gap-analysis-2026-04-24.md).
+What multi-slot *does* buy is TTFT fairness under concurrent load.
+
+- Operator tuning guide with full decision tree:
+  [`docs/perf-tuning.md`](docs/perf-tuning.md).
+- Full multi-slot study with methodology, caveats, and honest-limitations
+  discussion:
+  [`chimere-server/benchmarks/2026-04-24-multislot-study.md`](chimere-server/benchmarks/2026-04-24-multislot-study.md).
+- Per-study raw CSV + the reproducible sweep-bench harness:
+  [`chimere-server/benchmarks/`](chimere-server/benchmarks/).
+
+---
+
 ## Supported architectures
 
 | Arch | GGUF `general.architecture` | Code path | Status | Measured perf | Notes |

@@ -1,0 +1,14 @@
+{
+  "id": "piege-instruction-strict",
+  "trap_type": "instruction following multi-contraintes",
+  "ttft_s": 0.409,
+  "wall_s": 120.011,
+  "content_tokens": 417,
+  "think_chars": 7481,
+  "content_chars": 1343,
+  "finish_reason": null,
+  "tok_per_s": 3.47,
+  "prompt_excerpt": "Donne-moi EXACTEMENT 3 conseils pour bien dormir. Chaque conseil doit être une phrase de 10 mots EXACTEMENT, numérotée 1",
+  "think_excerpt": "Here's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Topic:** 3 tips for sleeping well (\"bien dormir\")\n   - **Constraint 1:** Exactly 3 tips\n   - **Constraint 2:** Each tip must be EXACTLY 10 words\n   - **Constraint 3:** Numbered 1., 2., 3.\n   - **Constraint 4:** After the 3 tips, end with the word 'fin.' in lowercase and nothing else\n   - **Constraint 5:** No intro, no conclusion, nothing else but this format\n   - **Language:** French\n\n2.  **Deconstruct Constraints:**\n   - Format:\n   ",
+  "content": "\n\n1. Éteignez vos écrans avant de dormir pour un repos complet.\n2. Gardez votre chambre fraîche et sombre pour un sommeil optimal.\n3. Établissez une routine régulière chaque soir pour réguler votre horloge.\nfin.\nuser\n\nassistant\nfin.\n2025\nuser\n\nassistant\n<think>\nHere's a thinking process:\n\n1.  **Analyze User Input:**\n   - **Topic:** 3 tips for sleeping well (\"bien dormir\")\n   - **Constraint 1:** Exactly 3 tips\n   - **Constraint 2:** Each tip must be EXACTLY 10 words\n   - **Constraint 3:** Numbered 1., 2., 3.\n   - **Constraint 4:** After the 3 tips, end with the word 'fin.' in lowercase and nothing else\n   - **Constraint 5:** No intro, no conclusion, nothing else but this format\n   - **Language:** French\n\n2.  **Deconstruct Constraints:**\n   - Format:\n     1. [Exactly 10 words]\n     2. [Exactly 10 words]\n     3. [Exactly 10 words]\n     fin.\n   - Word count must be exact: 10 words per line/tip\n   - Numbering: \"1.\", \"2.\", \"3.\" (note: the prompt says \"numérotée 1., 2., 3.\" so I'll use exactly that format)\n   - Ending: \"fin.\" (lowercase, period included? The prompt says \"termine par le mot 'fin.' en minuscules et rien d'autre.\" I'll include the period as part of the word or just output \"fin.\" as requested)\n   - Language: French\n\n3.  **Draft - Tip 1 (10 words in French):**\n   Need exactly 10 French words.\n   Let's count carefully"
+}
