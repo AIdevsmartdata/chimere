@@ -52,6 +52,7 @@ pub mod raw_forward;
 pub mod raw_weights;
 pub mod rope;
 pub mod scratch_pool;
+pub mod slot_scheduler;
 pub mod state;
 pub mod trace;
 pub mod turboquant;
