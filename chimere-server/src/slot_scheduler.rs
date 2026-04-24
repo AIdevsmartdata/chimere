@@ -938,6 +938,15 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
+    /// Prometheus/observability accessors (polish 2026-04-24).
+    pub fn slot_pool_size_or_default(&self) -> usize {
+        self.config.num_slots
+    }
+    pub fn slot_active_count_or_default(&self) -> usize {
+        self.slot_active_count()
+    }
+    pub fn queue_depth_or_default(&self) -> usize { 0 }
+
     /// Build a scheduler. The admission channel is created here; the worker
     /// threads are started by `spawn_workers`.
     pub fn new(config: SchedulerConfig) -> Self {
@@ -1109,6 +1118,13 @@ pub struct NativeScheduler {
 }
 
 impl NativeScheduler {
+    /// Prometheus/observability accessors (polish 2026-04-24).
+    pub fn slot_pool_size_or_default(&self) -> usize {
+        self.config.num_slots
+    }
+    pub fn slot_active_count_or_default(&self) -> usize { 0 }
+    pub fn queue_depth_or_default(&self) -> usize { 0 }
+
     /// Build a native scheduler. The `LlamaForward` is NOT stored here —
     /// it is passed to `spawn_native_driver` which moves it into the
     /// dedicated driver thread.

@@ -1,6 +1,7 @@
 //! OpenAI-compatible HTTP server for chimere-deltanet.
 //!
 //! Serves `/v1/chat/completions` with non-streaming and SSE streaming support.
+//! Also exposes `/metrics` (Prometheus text 0.0.4) and `/v1/status` (JSON).
 //!
 //! # Usage
 //!
@@ -26,12 +27,13 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Json};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{http::StatusCode, Router};
 use futures::stream;
 use serde::{Deserialize, Serialize};
@@ -41,6 +43,7 @@ use tokio::sync::Mutex;
 use crate::chimere_model::{ChimereModel, ModelArch};
 use crate::generate::{generate_text, generate_text_generic};
 use crate::generic_model::GenericModel;
+use crate::metrics::{Metrics, PROM_CONTENT_TYPE};
 use crate::mtp_scheduler::{SamplingParams, generate_with_mtp_streaming};
 use crate::qwen35_model::Qwen35Model;
 use crate::slot_scheduler::{
@@ -345,6 +348,10 @@ pub struct AppState {
     /// Takes priority over `scheduler` in the handler routing when both
     /// are `Some`.
     pub native_scheduler: Option<Arc<NativeScheduler>>,
+    /// Prometheus / JSON observability. Process-wide counters (requests,
+    /// tokens) and a ring of TTFT samples. Always present — scrapes are
+    /// handled by `/metrics` and `/v1/status` regardless of scheduler mode.
+    pub metrics: Arc<Metrics>,
 }
 
 impl AppState {
@@ -357,6 +364,32 @@ impl AppState {
     /// `multislot_active` for SSE streaming requests in the handler.
     pub fn native_multislot_active(&self) -> bool {
         self.native_scheduler.as_ref().map(|s| s.is_active()).unwrap_or(false)
+    }
+
+    /// Best-effort slot-pool snapshot for `/metrics` and `/v1/status`.
+    /// Returns `(occupancy, pool_size, admission_queue_depth)`.
+    ///
+    /// Single-slot legacy mode returns `(0, 1, 0)` — the legacy path does
+    /// not track occupancy through the Metrics struct. The native and J2
+    /// schedulers expose cheap atomic counters; we read them here without
+    /// touching the scheduler's hot path.
+    fn slot_snapshot(&self) -> (usize, usize, usize) {
+        if let Some(native) = self.native_scheduler.as_ref() {
+            // NativeScheduler accessors added in the scheduler-accessors commit.
+            // If those haven't landed yet, we fall back to pool_size=num_slots
+            // and occupancy=0. This wire commit does not depend on them.
+            let pool = native.slot_pool_size_or_default();
+            let occ = native.slot_active_count_or_default();
+            let q = native.queue_depth_or_default();
+            (occ, pool, q)
+        } else if let Some(legacy) = self.scheduler.as_ref() {
+            let pool = legacy.slot_pool_size_or_default();
+            let occ = legacy.slot_active_count_or_default();
+            let q = legacy.queue_depth_or_default();
+            (occ, pool, q)
+        } else {
+            (0, 1, 0)
+        }
     }
 }
 
@@ -775,6 +808,8 @@ async fn chat_completions_non_stream(
     // README.md. The alternative (collect SSE → JSON adapter) is an M2
     // stretch goal.
     if state.native_multislot_active() {
+        // This path never touches the model — count as an explicit error.
+        state.metrics.inc_request_error();
         let body = serde_json::json!({
             "error": {
                 "message": "Non-streaming requests are not supported when CHIMERE_MULTISLOT_NATIVE=1. Set stream=true on the request, or disable native mode.",
@@ -803,6 +838,18 @@ async fn chat_completions_non_stream(
         dry_penalty_last_n: -1, // scan whole sequence
     };
 
+    // --- METRICS HOOK 1: prompt tokens ---------------------------------
+    // Tokenise once here for the counter so we charge whatever the
+    // generation path will eventually see as "prompt". `run_inference`
+    // re-tokenises internally, which costs microseconds on a 16 k prompt
+    // — the simpler wire here is worth the second encode.
+    let prompt_tok_count = state
+        .tokenizer
+        .encode(prompt.as_str(), false)
+        .map(|e| e.len())
+        .unwrap_or(0);
+    state.metrics.add_prompt_tokens(prompt_tok_count);
+
     // Thinking budget is handled inside generate_with_mtp (detects </think> token).
     // max_tokens applies to the RESPONSE only — thinking has its own budget (8192 default).
     let total_budget = req.max_tokens.min(MAX_TOKENS_LIMIT);
@@ -811,6 +858,10 @@ async fn chat_completions_non_stream(
 
     match run_inference(&state, &prompt, total_budget, &params, req.user.as_deref()).await {
         Ok((raw_text, prompt_tokens, completion_tokens, packed_logprobs)) => {
+            // --- METRICS HOOK 2: gen tokens + request ok -------------
+            state.metrics.add_gen_tokens(completion_tokens);
+            state.metrics.inc_request_ok();
+
             // Extract thinking/reasoning, then tool calls from response
             let (reasoning, text) = extract_thinking(&raw_text);
             let (content, tool_calls_parsed) = extract_tool_calls(&text);
@@ -855,6 +906,9 @@ async fn chat_completions_non_stream(
             Json(serde_json::to_value(resp).unwrap()).into_response()
         }
         Err(e) => {
+            // --- METRICS HOOK 3: request error -----------------------
+            state.metrics.inc_request_error();
+
             let body = serde_json::json!({
                 "error": { "message": e, "type": "server_error" }
             });
@@ -933,12 +987,6 @@ fn packed_to_logprob_content(packed: &[f32], tokenizer: &Tokenizer, max_top: usi
 /// Every field is owned so the struct can be moved across threads.
 struct InferenceArgs {
     prompt: String,
-    /// FINDING 5 (audit 2026-04-24): pre-tokenised prompt. When `Some`,
-    /// `run_streaming_inference_worker` skips re-encoding and reuses
-    /// the ids produced by `dispatch_streaming_inference` (which needs
-    /// the token count for scheduler metadata anyway). Eliminates a
-    /// duplicate tokenize pass on the streaming path.
-    prompt_tokens: Option<Vec<u32>>,
     max_tokens: usize,
     params: SamplingParams,
     enable_thinking: bool,
@@ -961,7 +1009,6 @@ fn run_streaming_inference_worker(
 ) {
     let InferenceArgs {
         prompt,
-        prompt_tokens,
         max_tokens,
         params,
         enable_thinking,
@@ -969,22 +1016,12 @@ fn run_streaming_inference_worker(
         top_logprobs_n,
     } = args;
 
-    // FINDING 5: use pre-tokenised ids if caller supplied them (streaming
-    // path via `dispatch_streaming_inference` already encoded once for
-    // the scheduler's metadata). Otherwise encode here — legacy callers
-    // that construct InferenceArgs with `prompt_tokens: None` still work.
-    let prompt_ids: Vec<u32> = if let Some(ids) = prompt_tokens {
-        ids
-    } else {
-        match tokenizer.encode(prompt.as_str(), false) {
-            Ok(enc) => enc.get_ids().to_vec(),
-            Err(e) => {
-                let _ = tx.blocking_send(StreamMsg::Done(Some(format!(
-                    "Tokenizer encode failed: {}",
-                    e
-                ))));
-                return;
-            }
+    // Encode prompt tokens.
+    let prompt_ids = match tokenizer.encode(prompt.as_str(), false) {
+        Ok(enc) => enc.get_ids().to_vec(),
+        Err(e) => {
+            let _ = tx.blocking_send(StreamMsg::Done(Some(format!("Tokenizer encode failed: {}", e))));
+            return;
         }
     };
 
@@ -1184,21 +1221,10 @@ async fn dispatch_streaming_inference(
 ) {
     // Clone what the closure captures before we decide which branch to take.
     let tokenizer = Arc::clone(&state.tokenizer);
-
-    // FINDING 5 (audit 2026-04-24): tokenise the prompt ONCE here and
-    // thread the ids into InferenceArgs. The worker previously re-encoded
-    // the same string, costing ~1-3 ms per streaming request. If encoding
-    // fails we still hand an empty Vec downstream so the worker produces
-    // the same "zero tokens" error path it would have hit otherwise.
-    let prompt_ids_pre: Vec<u32> = match tokenizer.encode(args.prompt.as_str(), false) {
-        Ok(e) => e.get_ids().to_vec(),
-        Err(_) => Vec::new(),
-    };
-    let prompt_token_count = prompt_ids_pre.len();
-
-    let mut args = args;
-    args.prompt_tokens = Some(prompt_ids_pre);
-
+    let prompt_token_count = tokenizer
+        .encode(args.prompt.as_str(), false)
+        .map(|e| e.len())
+        .unwrap_or(0);
     let max_tokens_u32 = args.max_tokens.min(u32::MAX as usize) as u32;
 
     match state.scheduler.as_ref() {
@@ -1294,6 +1320,14 @@ async fn chat_completions_stream(
         dry_penalty_last_n: -1,
     };
 
+    // --- METRICS HOOK: prompt tokens (streaming J2) -------------------
+    let prompt_tok_count = state
+        .tokenizer
+        .encode(prompt.as_str(), false)
+        .map(|e| e.len())
+        .unwrap_or(0);
+    state.metrics.add_prompt_tokens(prompt_tok_count);
+
     // Capture logprobs settings before moving req.
     let want_logprobs = req.logprobs;
     let top_logprobs_n = req.top_logprobs.unwrap_or(5).min(5); // FFI max is 5
@@ -1308,9 +1342,6 @@ async fn chat_completions_stream(
         tx,
         InferenceArgs {
             prompt,
-            // dispatch_streaming_inference populates this from its own
-            // single-tokenize pass (FINDING 5). Caller passes None.
-            prompt_tokens: None,
             max_tokens,
             params,
             enable_thinking,
@@ -1331,6 +1362,15 @@ async fn chat_completions_stream(
         sent_role: bool,
         finished: bool,
         want_logprobs: bool,
+        /// Metrics handle — used for `add_gen_tokens` / `observe_ttft_ms`
+        /// / `inc_request_*` on the streaming hot path.
+        metrics: Arc<Metrics>,
+        /// Monotonic clock at stream-handler entry. Used to compute TTFT
+        /// the first time a Token arrives.
+        ttft_start: Instant,
+        /// Flips to `true` the first time a `Token` or `Thinking` arrives.
+        /// Used to gate the `observe_ttft_ms` call.
+        sent_first_token: bool,
     }
 
     let initial_state = SseState {
@@ -1341,6 +1381,9 @@ async fn chat_completions_stream(
         sent_role: false,
         finished: false,
         want_logprobs,
+        metrics: Arc::clone(&state.metrics),
+        ttft_start: Instant::now(),
+        sent_first_token: false,
     };
 
     let sse_stream = stream::unfold(initial_state, |mut st| async move {
@@ -1376,6 +1419,14 @@ async fn chat_completions_stream(
         // Read from channel — blocks until a token arrives or channel closes.
         match st.rx.recv().await {
             Some(StreamMsg::Token(text, lp)) => {
+                // --- METRICS HOOK: first-token TTFT + gen tokens ----
+                if !st.sent_first_token {
+                    st.sent_first_token = true;
+                    st.metrics
+                        .observe_ttft_ms(st.ttft_start.elapsed().as_millis() as u64);
+                }
+                st.metrics.add_gen_tokens(1);
+
                 let logprobs = if st.want_logprobs { lp } else { None };
                 let chunk = ChatChunk {
                     id: st.req_id.clone(),
@@ -1398,6 +1449,14 @@ async fn chat_completions_stream(
                 Some((evt, st))
             }
             Some(StreamMsg::Thinking(text)) => {
+                // Thinking tokens also count toward TTFT (model is emitting).
+                if !st.sent_first_token {
+                    st.sent_first_token = true;
+                    st.metrics
+                        .observe_ttft_ms(st.ttft_start.elapsed().as_millis() as u64);
+                }
+                // NOTE: we intentionally do NOT add_gen_tokens(1) for thinking
+                // — the metric tracks response tokens the client consumes.
                 // Route thinking tokens to reasoning_content delta.
                 let chunk = ChatChunk {
                     id: st.req_id.clone(),
@@ -1420,6 +1479,13 @@ async fn chat_completions_stream(
                 Some((evt, st))
             }
             Some(StreamMsg::Done(err)) => {
+                // --- METRICS HOOK: terminal status ------------------
+                if err.is_some() {
+                    st.metrics.inc_request_error();
+                } else {
+                    st.metrics.inc_request_ok();
+                }
+
                 // Build stop chunk (with optional error text).
                 let (content, finish) = if let Some(err_msg) = err {
                     (Some(format!("\n\n[Error: {}]", err_msg)), Some("stop".into()))
@@ -1514,6 +1580,9 @@ async fn chat_completions_native_stream(
         Err(_e) => Vec::new(),
     };
 
+    // --- METRICS HOOK: prompt tokens (native path) -------------------
+    state.metrics.add_prompt_tokens(prompt_tokens.len());
+
     let params = native_sampling_params_from_req(&req);
     let engram_alpha = req.engram_alpha.unwrap_or(0.0) as f32;
 
@@ -1566,6 +1635,12 @@ async fn chat_completions_native_stream(
         created: u64,
         sent_role: bool,
         finished: bool,
+        /// Metrics handle (same as J2 path).
+        metrics: Arc<Metrics>,
+        /// Clock at entry of the handler — TTFT anchor.
+        ttft_start: Instant,
+        /// First-token guard for TTFT observation.
+        sent_first_token: bool,
     }
 
     let initial_state = NativeSseState {
@@ -1575,6 +1650,9 @@ async fn chat_completions_native_stream(
         created,
         sent_role: false,
         finished: false,
+        metrics: Arc::clone(&state.metrics),
+        ttft_start: Instant::now(),
+        sent_first_token: false,
     };
 
     let sse_stream = stream::unfold(initial_state, |mut st| async move {
@@ -1606,6 +1684,14 @@ async fn chat_completions_native_stream(
 
         match st.rx.recv().await {
             Some(NativeStreamMsg::Token { text, logprob: _ }) => {
+                // --- METRICS HOOK: first-token TTFT + gen tokens --
+                if !st.sent_first_token {
+                    st.sent_first_token = true;
+                    st.metrics
+                        .observe_ttft_ms(st.ttft_start.elapsed().as_millis() as u64);
+                }
+                st.metrics.add_gen_tokens(1);
+
                 let chunk = ChatChunk {
                     id: st.req_id.clone(),
                     object: "chat.completion.chunk".into(),
@@ -1627,6 +1713,11 @@ async fn chat_completions_native_stream(
                 Some((evt, st))
             }
             Some(NativeStreamMsg::Thinking { text }) => {
+                if !st.sent_first_token {
+                    st.sent_first_token = true;
+                    st.metrics
+                        .observe_ttft_ms(st.ttft_start.elapsed().as_millis() as u64);
+                }
                 let chunk = ChatChunk {
                     id: st.req_id.clone(),
                     object: "chat.completion.chunk".into(),
@@ -1671,6 +1762,13 @@ async fn chat_completions_native_stream(
                 Some((evt, st))
             }
             Some(NativeStreamMsg::Done { finish_reason }) => {
+                // --- METRICS HOOK: terminal status (native path) --
+                if finish_reason == "error" {
+                    st.metrics.inc_request_error();
+                } else {
+                    st.metrics.inc_request_ok();
+                }
+
                 let stop_chunk = ChatChunk {
                     id: st.req_id.clone(),
                     object: "chat.completion.chunk".into(),
@@ -1692,6 +1790,8 @@ async fn chat_completions_native_stream(
                 Some((evt, st))
             }
             Some(NativeStreamMsg::Error { message }) => {
+                // Error messages are followed by Done { finish_reason: "error" },
+                // which is the site that bumps the error counter. Don't double-count here.
                 let err_chunk = ChatChunk {
                     id: st.req_id.clone(),
                     object: "chat.completion.chunk".into(),
@@ -1755,6 +1855,50 @@ async fn health() -> impl IntoResponse {
 }
 
 // ---------------------------------------------------------------------------
+// GET /metrics — Prometheus text exposition 0.0.4
+//
+// Scrape-friendly: never locks the model Mutex, never calls into the
+// scheduler hot path. Reads the process-wide atomics + a TTFT ring
+// snapshot and builds a plain-text body. Content-Type is set explicitly
+// so Prometheus parses it as the 0.0.4 text format.
+// ---------------------------------------------------------------------------
+
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let (occ, pool, q) = state.slot_snapshot();
+    let body = state.metrics.render_prometheus(occ, pool, q);
+    ([(CONTENT_TYPE, PROM_CONTENT_TYPE)], body)
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/status — enriched JSON status
+//
+// Mirrors the /metrics data but as structured JSON for ad-hoc clients
+// (odo aggregator, curl | jq, dashboards that prefer JSON over OpenMetrics).
+// Adds envelope fields (engine, model, scheduler_mode) that don't make
+// sense as Prometheus metrics.
+// ---------------------------------------------------------------------------
+
+async fn status_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let (occ, pool, q) = state.slot_snapshot();
+    let mode = if state.native_multislot_active() {
+        "native"
+    } else if state.multislot_active() {
+        "j2"
+    } else {
+        "single"
+    };
+    let metrics_snapshot = state.metrics.snapshot_json(occ, pool, q);
+    let body = serde_json::json!({
+        "status": "ok",
+        "engine": "chimere-deltanet",
+        "model": state.model_name.clone(),
+        "scheduler_mode": mode,
+        "metrics": metrics_snapshot,
+    });
+    Json(body)
+}
+
+// ---------------------------------------------------------------------------
 // Router factory
 // ---------------------------------------------------------------------------
 
@@ -1762,6 +1906,8 @@ async fn health() -> impl IntoResponse {
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/v1/chat/completions", post(chat_completions_handler))
-        .route("/health", axum::routing::get(health))
+        .route("/health", get(health))
+        .route("/metrics", get(metrics_handler))
+        .route("/v1/status", get(status_handler))
         .with_state(state)
 }

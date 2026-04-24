@@ -32,6 +32,12 @@
 //! | `CHIMERE_MULTISLOT_NATIVE` | (unset)                                                        | Set to `1` with `CHIMERE_MULTISLOT>=2` to arm the J4-rewrite NativeScheduler |
 //! | `CHIMERE_NATIVE_ENGRAM_ALPHA` | `0.0`                                                       | Default engram bias alpha used by NativeScheduler when request does not override |
 //! | `CHIMERE_SKIP_LEGACY_LLAMA` | (unset)                                                       | Set to `1` to skip the legacy `Qwen35Model::init_llama_forward` when NativeScheduler is armed (saves ~KV cache VRAM) |
+//!
+//! # Observability
+//!
+//! - `GET /health` — liveness (cheap, no lock).
+//! - `GET /metrics` — Prometheus text exposition 0.0.4.
+//! - `GET /v1/status` — JSON snapshot (envelope + metrics block).
 
 use std::sync::Arc;
 
@@ -40,6 +46,7 @@ use chimere_deltanet::chimere_model::ModelArch;
 use chimere_deltanet::generate::load_tokenizer;
 use chimere_deltanet::generic_model::GenericModel;
 use chimere_deltanet::gguf_loader::GgufFile;
+use chimere_deltanet::metrics::Metrics;
 use chimere_deltanet::qwen35_model::Qwen35Model;
 use chimere_deltanet::server::{AppState, AppStateModel, build_router};
 use chimere_deltanet::slot_scheduler::{NativeScheduler, Scheduler, SchedulerConfig};
@@ -512,6 +519,11 @@ async fn main() {
         // When disabled (prod default), stays None and all requests take the
         // legacy `Mutex<AppStateModel>` path.
         native_scheduler: native_scheduler_arc,
+        // polish-prometheus: process-wide Metrics handle. Cheap to construct
+        // (a handful of atomics + a Mutex<Vec<u64>>). Always present so the
+        // /metrics scrape endpoint has something to render even before the
+        // first request.
+        metrics: Arc::new(Metrics::new()),
     });
 
     let app = build_router(state);
@@ -523,6 +535,8 @@ async fn main() {
     eprintln!("[chimere-server] Endpoints:");
     eprintln!("  POST http://{}/v1/chat/completions", addr);
     eprintln!("  GET  http://{}/health", addr);
+    eprintln!("  GET  http://{}/metrics", addr);
+    eprintln!("  GET  http://{}/v1/status", addr);
 
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,

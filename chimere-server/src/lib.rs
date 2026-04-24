@@ -45,6 +45,7 @@ pub mod gguf_loader;
 pub mod hybrid_attention;
 pub mod moe_forward;
 pub mod moe_router;
+pub mod metrics;
 pub mod mtp_scheduler;
 pub mod prefill;
 pub mod qwen35_model;
