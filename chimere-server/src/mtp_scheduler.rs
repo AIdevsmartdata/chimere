@@ -947,6 +947,7 @@ pub fn generate_with_mtp_streaming(
     state: &mut crate::state::GdnRecurrentState,
     params: &SamplingParams,
     tokenizer: Option<&tokenizers::Tokenizer>,
+    thinking_active: bool,
     token_callback: &mut dyn FnMut(u32, &str, bool) -> bool,
 ) -> Result<MtpStats> {
     let total_budget = std::env::var("CHIMERE_THINK_BUDGET")
@@ -955,11 +956,11 @@ pub fn generate_with_mtp_streaming(
     let mut tokens = Vec::new();
     let mut stats = MtpStats::default();
     let mut current_token = prompt_token;
-    // Thinking mode: check server signal (env var set by chimere-server per-request).
-    // Falls back to prompt_token detection if env var not set.
+    // Thinking mode: explicit parameter from the handler (no more per-request
+    // env var mutation — that was a global race under multi-slot native mode).
+    // Falls back to prompt_token detection for direct callers that pass false.
     const THINK_START: u32 = 248068; // <think>
-    let thinking_from_env = std::env::var("CHIMERE_THINKING_ACTIVE").is_ok();
-    let mut thinking = thinking_from_env || prompt_token == THINK_START;
+    let mut thinking = thinking_active || prompt_token == THINK_START;
 
     // Engram: O(1) hash lookup for n-gram predictions → logit biasing
     // Step 7: gate on arch (Qwen3.5 only) — see generate_with_mtp for rationale.

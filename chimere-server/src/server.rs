@@ -1060,14 +1060,8 @@ fn run_streaming_inference_body(
                 let tok_ref = &*tokenizer_clone;
                 let model_ref: &dyn ChimereModel = qwen;
 
-                // Signal thinking mode to the scheduler via env var (thread-local safe
-                // because we're on a dedicated OS thread per request).
-                if enable_thinking {
-                    std::env::set_var("CHIMERE_THINKING_ACTIVE", "1");
-                } else {
-                    std::env::remove_var("CHIMERE_THINKING_ACTIVE");
-                }
-
+                // Pass thinking mode as explicit parameter — no more env var
+                // mutation, which was a global race under multi-slot native.
                 let result = generate_with_mtp_streaming(
                     model_ref,
                     last_tok,
@@ -1075,6 +1069,7 @@ fn run_streaming_inference_body(
                     &mut inf_state,
                     &params,
                     Some(tok_ref),
+                    enable_thinking,
                     &mut |_token_id: u32, decoded_text: &str, is_thinking: bool| -> bool {
                         // Drain logprobs (avoids stale data). Only build content if requested.
                         let logprob_content = if want_logprobs {
