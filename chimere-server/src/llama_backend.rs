@@ -356,6 +356,9 @@ extern "C" {
     fn llama_model_is_hybrid(model: *const LlamaModel) -> bool;
     fn llama_model_is_recurrent(model: *const LlamaModel) -> bool;
     fn llama_model_has_recurrent(model: *const LlamaModel) -> bool;
+    // End-of-generation check — covers all EOG tokens declared in the GGUF
+    // vocab (im_end, endoftext, etc.). Used by slot_scheduler to terminate.
+    fn llama_token_is_eog(model: *const LlamaModel, token: i32) -> bool;
 
     // ggml function for CPU buffer type (needed for ncmoe overrides)
     fn ggml_backend_cpu_buffer_type() -> *mut GgmlBackendBufferType;
@@ -1517,6 +1520,15 @@ impl LlamaForward {
     /// The returned pointer is only valid while `self` is live.
     pub unsafe fn model_raw(&self) -> *const LlamaModel {
         self.model as *const LlamaModel
+    }
+
+    /// `true` iff `token` is end-of-generation per the loaded vocab.
+    /// Covers all Qwen3.5 EOG tokens (<|im_end|> 248046, <|endoftext|>
+    /// 248044, plus future arch-specific terminators declared in the
+    /// GGUF metadata). Safe wrapper over `llama_token_is_eog`.
+    pub fn token_is_eog(&self, token: i32) -> bool {
+        if token < 0 { return false; }
+        unsafe { llama_token_is_eog(self.model, token) }
     }
 
     /// Sample with a caller-provided per-slot sampler handle at a specific

@@ -1675,6 +1675,19 @@ impl NativeDriver {
         slot.push_context(tok);
         slot.stats.generated_tokens = slot.stats.generated_tokens.saturating_add(1);
 
+        // End-of-generation check. libllama's `token_is_eog` returns true for
+        // every EOG token declared in the loaded GGUF's vocab metadata — on
+        // Qwen3.5 that's `<|im_end|>` (248046), `<|endoftext|>` (248044) and
+        // a handful of fim/pad markers. Without this guard the native driver
+        // would emit the special token (rendered as empty by
+        // `token_to_piece(_, special=false)`) and keep looping until
+        // `max_tokens`, so finish_reason ends up as "length" instead of
+        // "stop". Regression: tests/stop_token_imend.rs.
+        if self.llama.token_is_eog(tok as i32) {
+            slot.mark_draining("stop");
+            return;
+        }
+
         // On-token housekeeping: thinking flip, stop tokens.
         let was_thinking = slot.thinking;
         let cont = slot.on_token_sampled(tok);

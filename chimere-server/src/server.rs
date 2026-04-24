@@ -1559,7 +1559,13 @@ fn native_sampling_params_from_req(req: &ChatRequest) -> NativeSamplingParams {
         min_p: 0.05,
         presence_penalty: req.presence_penalty as f32,
         max_tokens: req.max_tokens.min(MAX_TOKENS_LIMIT) as u32,
-        stop_tokens: Vec::new(), // reserved for M2; clients pass via req.stop (not yet wired)
+        // Defense-in-depth: always stop on Qwen3.5 EOS tokens. The primary
+        // EOS termination path is llama_token_is_eog via emit_sampled_token
+        // (see slot_scheduler.rs), which covers every EOG token flagged in
+        // the GGUF vocab. This hardcoded fallback guards against custom
+        // GGUFs with broken metadata. Client-supplied req.stop (string list)
+        // is still deferred to M2.
+        stop_tokens: vec![crate::generate::TOKEN_IM_END, crate::generate::TOKEN_ENDOFTEXT],
         enable_thinking,
     }
 }
