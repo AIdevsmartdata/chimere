@@ -226,6 +226,13 @@ pub struct Slot {
     /// J6 — reason captured when `mark_draining()` is called. Consumed by
     /// the dispatcher when it sends the terminal `StreamMsg::Done`.
     pub finish_reason: Option<String>,
+    /// J6 — `true` while the current token stream is inside a
+    /// `<think>...</think>` block. Flipped off in `on_token_sampled` when
+    /// the just-sampled token equals the `</think>` closer. Mirrors the
+    /// `thinking` bool in `mtp_scheduler::generate_with_mtp_streaming`
+    /// so SSE frames can choose between `reasoning_content` (Thinking)
+    /// and `content` (Token).
+    pub thinking: bool,
 }
 
 impl Slot {
@@ -249,6 +256,7 @@ impl Slot {
             stats: SlotStats::default(),
             cancelled: Arc::new(AtomicBool::new(false)),
             finish_reason: None,
+            thinking: false,
         }
     }
 
@@ -275,6 +283,7 @@ impl Slot {
         self.stats = SlotStats::default();
         self.cancelled.store(false, Ordering::SeqCst);
         self.finish_reason = None;
+        self.thinking = false;
         // J5a: reset per-slot sampler state between conversations.
         if let Some(s) = self.sampler.as_ref() {
             s.reset();
@@ -283,8 +292,17 @@ impl Slot {
     }
 
     // ------------------------------------------------------------------
-    // J6 — rollout safety: stop tokens terminate generation
+    // J6 — rollout safety: stop tokens, </think> toggle
     // ------------------------------------------------------------------
+
+    /// Canonical Qwen3.5 closing thinking token. Mirrors the `THINK_END`
+    /// constant in `mtp_scheduler.rs` so the two code paths agree on the
+    /// exact id. Hard-coded on purpose — if the tokenizer changes this we
+    /// want the test suite to break loudly rather than silently infer.
+    pub const THINK_END_TOKEN: u32 = 248069;
+    /// Canonical Qwen3.5 opening thinking token (tracked for symmetry;
+    /// the opener is in the prompt template, not normally re-sampled).
+    pub const THINK_START_TOKEN: u32 = 248068;
 
     /// Transition into the terminal `Draining` state. The dispatcher is
     /// expected to observe this on the next scheduler tick, emit the final
@@ -314,17 +332,30 @@ impl Slot {
 
     /// Called right after a token has been sampled by the scheduler's
     /// per-step logic. Returns `true` if generation should continue on
-    /// this slot, `false` if the slot must stop (stop-token hit).
+    /// this slot, `false` if the slot must stop (stop-token hit). The
+    /// slot's `thinking` flag is updated **before** we evaluate stop
+    /// tokens so that the `</think>` closer (which may also be present
+    /// in a client-supplied stop list for non-thinking clients) still
+    /// exits reasoning cleanly on the first occurrence — the flag flip
+    /// happens either way.
     ///
     /// When this returns `false`, the caller MUST:
     ///   1. call `mark_draining("stop")` on this slot, and
-    ///   2. emit the sampled token AS-IS to the stream, then
+    ///   2. emit the sampled token AS-IS to the stream (so the client
+    ///      sees the `</think>` closer on screen rather than a truncated
+    ///      reasoning block), then
     ///   3. emit the terminal `StreamMsg::Done` frame.
-    ///
-    /// J6c extends this with a `</think>` toggle that flips `thinking`
-    /// off before evaluating stop tokens; J6d adds disconnect detection.
     pub fn on_token_sampled(&mut self, tok: u32) -> bool {
-        // Per-request stop tokens defined on SamplingParams.
+        // 1) Toggle thinking on encountering `</think>`. This MUST happen
+        //    before stop-token evaluation, because a client may well add
+        //    `</think>` to `stop` even when thinking is active (seen in
+        //    OpenClaw ODO routing). Semantics we pick: the closer token
+        //    itself always flips thinking off; *then* stop-token logic
+        //    decides whether to also terminate the stream.
+        if self.thinking && tok == Self::THINK_END_TOKEN {
+            self.thinking = false;
+        }
+        // 2) Per-request stop tokens defined on SamplingParams.
         if self.params.stop_tokens.contains(&tok) {
             return false;
         }
