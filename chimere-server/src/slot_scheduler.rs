@@ -10,7 +10,7 @@
 //! - Legacy behaviour unchanged; scheduler is only active when
 //!   `CHIMERE_MULTISLOT >= 2`.
 //!
-//! ## J2 (this commit) — admission queue + worker loop
+//! ## J2 — admission queue + worker loop (closure-based)
 //!
 //! - `Scheduler::new()` takes the `SchedulerConfig`, allocates an `mpsc`
 //!   admission channel, and holds the receiver end until `spawn_worker` is
@@ -29,13 +29,30 @@
 //!   the `Mutex<AppStateModel>` re-acquisitions between `generate_with_mtp`
 //!   bursts (see `chat_completions_stream` in `server.rs`).
 //!
-//! ## J3+ (future) — true multi-seq FFI
+//! ## J4-rewrite — NativeScheduler (this commit)
 //!
-//! - Replace the closure-based worker with a real `llama_decode` multi-seq
-//!   loop (1 OS thread, N slots, N samplers, N engram tables).
-//! - Per-slot KV save/restore via `llama_state_seq_save/restore` is already
-//!   implemented in `agent_scheduler.rs` and can be reused.
-//! - Goal: aggregate throughput ≥ 1.7× at 2 slots, ≥ 3× at 4 slots.
+//! - `NativeScheduler` owns the `LlamaForward` directly (transferred from
+//!   the main model loader at boot). A single OS thread drives
+//!   `forward_multi_seq` with per-slot sequence IDs.
+//! - `NativeScheduledRequest` carries raw prompt tokens + sampling params;
+//!   no closure indirection. The scheduler calls `forward_multi_seq`,
+//!   routes per-slot logits to per-slot samplers (J5a), applies per-slot
+//!   engram biases (J5b), emits tokens through per-slot channels (J6 try_emit).
+//! - Opt-in via `CHIMERE_MULTISLOT_NATIVE=1` (ignored unless
+//!   `CHIMERE_MULTISLOT>=2`). Legacy J2 closure path is unchanged.
+//! - Legacy `CHIMERE_MULTISLOT<2` path is bit-identical.
+//!
+//! ## J5+ achieved
+//!
+//! - Per-slot sampler via `SamplerHandle` (J5a, `Drop` frees C++ state).
+//! - Per-slot engram bias via `apply_engram_bias_to_sampler` (J5b).
+//! - `</think>` flip + stop tokens + try_emit on client disconnect (J6).
+//!
+//! ## M2+ (future)
+//!
+//! - Per-slot engram hot-swap (today shared via `attach_engram`).
+//! - Mixed prefill+gen in the same batch for non-qwen3next arches.
+//! - MTP re-enabled on a slot-exclusive basis.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -66,6 +83,11 @@ pub struct SchedulerConfig {
     /// `false` → legacy `Mutex<AppStateModel>` path (production today).
     /// `true` → route through the admission channel (J2+).
     pub enabled: bool,
+    /// J4-rewrite: `true` iff `CHIMERE_MULTISLOT_NATIVE=1` AND `enabled`.
+    /// When true, HTTP handlers route through `NativeScheduler` instead of
+    /// the closure-based `Scheduler`. Both schedulers can coexist in
+    /// `AppState` — see `server.rs::chat_completions_handler`.
+    pub native: bool,
 }
 
 impl SchedulerConfig {
@@ -89,10 +111,20 @@ impl SchedulerConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(ADMISSION_QUEUE_CAP);
 
+        let enabled = clamped >= 2;
+        let native = enabled
+            && std::env::var("CHIMERE_MULTISLOT_NATIVE")
+                .map(|v| {
+                    let t = v.trim();
+                    !(t.is_empty() || t == "0" || t.eq_ignore_ascii_case("false"))
+                })
+                .unwrap_or(false);
+
         Self {
             num_slots: clamped,
             queue_cap,
-            enabled: clamped >= 2,
+            enabled,
+            native,
         }
     }
 
@@ -101,11 +133,22 @@ impl SchedulerConfig {
     pub fn is_active(&self) -> bool {
         self.enabled
     }
+
+    /// `true` when the J4-rewrite native `forward_multi_seq` path should be
+    /// used. Requires `CHIMERE_MULTISLOT>=2 && CHIMERE_MULTISLOT_NATIVE=1`.
+    pub fn is_native(&self) -> bool {
+        self.native
+    }
 }
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
-        Self { num_slots: NUM_SLOTS_DEFAULT, queue_cap: ADMISSION_QUEUE_CAP, enabled: false }
+        Self {
+            num_slots: NUM_SLOTS_DEFAULT,
+            queue_cap: ADMISSION_QUEUE_CAP,
+            enabled: false,
+            native: false,
+        }
     }
 }
 
@@ -636,6 +679,12 @@ impl SlotPool {
         self.slots.iter().filter(|s| !s.is_free()).count()
     }
 
+    /// J4-rewrite — iterate all slots (free and active). Used by the
+    /// native dispatcher to reap `Draining` slots before the next tick.
+    pub fn all_mut(&mut self) -> impl Iterator<Item = &mut Slot> {
+        self.slots.iter_mut()
+    }
+
     /// J5a — allocate one independent C++ sampler per slot.
     ///
     /// Each slot gets its own `chimere_sampler` with the production
@@ -866,7 +915,7 @@ pub struct ScheduledRequestMeta {
 }
 
 // ---------------------------------------------------------------------------
-// Scheduler
+// Scheduler (J2 closure-based)
 // ---------------------------------------------------------------------------
 
 /// Scheduler handle. Owns the admission channel and (once `spawn_workers` is
@@ -999,6 +1048,687 @@ impl Scheduler {
     }
 }
 
+// ===========================================================================
+// J4-rewrite — NativeScheduler
+//
+// A second scheduler implementation that OWNS the LlamaForward directly
+// and drives `forward_multi_seq` from a dedicated OS thread. Opt-in via
+// CHIMERE_MULTISLOT_NATIVE=1 ; legacy Scheduler above is untouched.
+// ===========================================================================
+
+/// Native multi-slot work item. Carries raw prompt tokens + sampling params;
+/// no closure indirection. The HTTP handler builds one of these, sends it
+/// through the admission queue, and reads from its own per-request mpsc rx
+/// to stream SSE tokens.
+///
+/// ## Ownership
+///
+/// The scheduler dispatcher takes ownership of the request (`mpsc::Receiver`
+/// yields owned values). From that moment the HTTP handler's only reference
+/// to the request is the `rx` end of the per-request channel. Cancellation
+/// is observed by the dispatcher via `tx.try_send` returning Closed when
+/// the HTTP handler drops its axum SSE stream (which drops `rx`).
+pub struct NativeScheduledRequest {
+    pub request_id: String,
+    pub prompt_tokens: Vec<u32>,
+    pub params: SamplingParams,
+    pub engram_alpha: f32,
+    /// Reserved for M2+ multi-tenant domain routing. Today ignored; the
+    /// scheduler uses the globally attached engram lookup for all slots.
+    pub engram_hint: Option<String>,
+    pub tx: mpsc::Sender<StreamMsg>,
+    pub want_logprobs: bool,
+    pub top_logprobs_n: usize,
+    pub enable_thinking: bool,
+    pub cancelled: Arc<AtomicBool>,
+    pub enqueued_at: std::time::Instant,
+}
+
+/// Native scheduler. Owns the `LlamaForward` that drives `forward_multi_seq`.
+///
+/// The main loader (`bin/chimere-server.rs`) extracts `LlamaForward` from
+/// the original `Qwen35Model` / `GenericModel` and hands it to
+/// `NativeScheduler::new(...)`. The scheduler then owns the FFI context for
+/// the process lifetime. Legacy non-native HTTP requests (`stream=false`)
+/// stay in `AppState.model`, but that path can no longer serve Qwen35 when
+/// native mode is active — see `APPLY.md` red flag for details.
+pub struct NativeScheduler {
+    pub config: SchedulerConfig,
+    /// Sender half — HTTP handlers clone this into `admission_tx()`.
+    admission_tx: mpsc::Sender<NativeScheduledRequest>,
+    /// Consumed exactly once by `spawn_native_driver`.
+    admission_rx: Option<mpsc::Receiver<NativeScheduledRequest>>,
+    /// Global engram lookup, attached to every slot at driver startup.
+    /// `None` if `MultiEngramLookup::from_env()` returned None at boot.
+    engram_global: Option<Arc<crate::engram_lookup::MultiEngramLookup>>,
+    /// Default engram alpha used when the HTTP body does not override.
+    /// 0.0 means "engram disabled by default" even if tables are loaded.
+    pub default_engram_alpha: f32,
+    /// Flipped by `shutdown()`. Driver checks before each tick.
+    pub shutdown: Arc<AtomicBool>,
+}
+
+impl NativeScheduler {
+    /// Build a native scheduler. The `LlamaForward` is NOT stored here —
+    /// it is passed to `spawn_native_driver` which moves it into the
+    /// dedicated driver thread.
+    ///
+    /// # Parameters
+    /// - `config` — must have `config.native == true`, else returns Err.
+    /// - `engram_global` — optional `MultiEngramLookup` to attach to every
+    ///   slot at driver startup. Pass `None` to disable engram biasing.
+    /// - `default_engram_alpha` — alpha used when `NativeScheduledRequest`
+    ///   does not override (typically 0.8 matching mtp_scheduler defaults).
+    pub fn new(
+        config: SchedulerConfig,
+        engram_global: Option<Arc<crate::engram_lookup::MultiEngramLookup>>,
+        default_engram_alpha: f32,
+    ) -> Result<Self, String> {
+        if !config.is_native() {
+            return Err(format!(
+                "NativeScheduler::new called with non-native config: \
+                 enabled={}, native={}, num_slots={}. \
+                 Set CHIMERE_MULTISLOT>=2 AND CHIMERE_MULTISLOT_NATIVE=1.",
+                config.enabled, config.native, config.num_slots,
+            ));
+        }
+        let (tx, rx) = mpsc::channel(config.queue_cap);
+        Ok(Self {
+            config,
+            admission_tx: tx,
+            admission_rx: Some(rx),
+            engram_global,
+            default_engram_alpha,
+            shutdown: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Clone the admission sender. HTTP handlers use this to enqueue
+    /// `NativeScheduledRequest`.
+    pub fn admission_tx(&self) -> mpsc::Sender<NativeScheduledRequest> {
+        self.admission_tx.clone()
+    }
+
+    /// `true` when the scheduler is armed (num_slots>=2, native=true).
+    pub fn is_active(&self) -> bool {
+        self.config.is_native()
+    }
+
+    /// Request shutdown — the driver will exit after its next admission
+    /// recv timeout (or immediately if currently idle).
+    pub fn shutdown(&self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+
+    /// Spawn the single driver OS thread. Consumes `self.admission_rx` —
+    /// can only be called once. Returns the `JoinHandle` for the driver.
+    ///
+    /// # Parameters
+    /// - `llama` — the `LlamaForward` context, transferred in from the
+    ///   main loader. The driver owns it for the process lifetime.
+    ///
+    /// # Safety / Ownership
+    /// `llama` must have been constructed via `LlamaForward::new_multi_seq`
+    /// with `n_seq_max >= config.num_slots`. If this constraint is not
+    /// respected, `forward_multi_seq` will reject seq_ids `>= n_seq_max`
+    /// and the driver will log and drain the slot with `Error` messages.
+    pub fn spawn_native_driver(
+        &mut self,
+        llama: crate::llama_backend::LlamaForward,
+    ) -> Result<std::thread::JoinHandle<()>, String> {
+        let rx = self.admission_rx.take().ok_or_else(|| {
+            "NativeScheduler::spawn_native_driver called twice".to_string()
+        })?;
+        let shutdown = Arc::clone(&self.shutdown);
+        let num_slots = self.config.num_slots;
+        let engram_global = self.engram_global.clone();
+        let default_alpha = self.default_engram_alpha;
+
+        // Build the slot pool on the main thread so we can alloc_samplers
+        // here (model_ptr is valid while `llama` is alive). Then MOVE the
+        // pool into the driver thread alongside `llama`.
+        let mut pool = SlotPool::new(num_slots);
+        unsafe {
+            pool.alloc_samplers_with_dry(
+                llama.model_raw(),
+                0.6, 0.95, 20, 0.05, 0.0, // Qwen3.5 thinking defaults
+                0.8, 1.75, 2, -1, // DRY enabled (prod-matching)
+            )
+            .map_err(|e| format!("NativeScheduler: sampler alloc failed: {}", e))?;
+        }
+        if let Some(eg) = &engram_global {
+            pool.attach_engram(Arc::clone(eg), default_alpha);
+            eprintln!(
+                "[slot_scheduler:native] Attached global engram ({} tables) with alpha={}",
+                eg.len(), default_alpha,
+            );
+        }
+
+        let tick_us: u64 = std::env::var("CHIMERE_NATIVE_TICK_US")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let max_prefill_chunk: usize = std::env::var("CHIMERE_NATIVE_MAX_PREFILL_CHUNK")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(256);
+
+        eprintln!(
+            "[slot_scheduler:native] driver spawning: num_slots={}, tick_us={}, \
+             max_prefill_chunk={}, engram_attached={}",
+            num_slots, tick_us, max_prefill_chunk, engram_global.is_some(),
+        );
+
+        let handle = std::thread::Builder::new()
+            .name("chimere-native-driver".into())
+            .spawn(move || {
+                let mut driver = NativeDriver {
+                    llama,
+                    pool,
+                    rx,
+                    shutdown,
+                    max_prefill_chunk,
+                    tick_us,
+                };
+                driver.run();
+            })
+            .map_err(|e| format!("failed to spawn chimere-native-driver: {}", e))?;
+
+        Ok(handle)
+    }
+}
+
+/// Private driver state. Lives entirely on the driver OS thread; never
+/// shared across threads after `spawn_native_driver` moves it in.
+struct NativeDriver {
+    llama: crate::llama_backend::LlamaForward,
+    pool: SlotPool,
+    rx: mpsc::Receiver<NativeScheduledRequest>,
+    shutdown: Arc<AtomicBool>,
+    max_prefill_chunk: usize,
+    tick_us: u64,
+}
+
+impl NativeDriver {
+    /// Main driver loop. Alternates between admission drain, batch build,
+    /// forward_multi_seq, per-slot sample+emit, and reap.
+    fn run(&mut self) {
+        eprintln!("[slot_scheduler:native] driver main loop entered");
+        let mut tick_counter: u64 = 0;
+
+        while !self.shutdown.load(Ordering::SeqCst) {
+            tick_counter = tick_counter.wrapping_add(1);
+
+            // 1) Drain admission (non-blocking): pull as many new requests
+            //    as there are free slots.
+            self.admit_new();
+
+            // 2) Reap any slots already in Draining — emit final Done,
+            //    release KV pages, return slot to Free.
+            self.reap_draining();
+
+            // 3) If no active slots, wait for one admission or shutdown.
+            if self.pool.num_active() == 0 {
+                // Block on the next admission (up to 100 ms so shutdown can
+                // flip). Using try_recv + short sleep here so we don't need
+                // a tokio runtime on the driver thread.
+                match self.rx.try_recv() {
+                    Ok(req) => {
+                        self.seat_request(req);
+                    }
+                    Err(mpsc::error::TryRecvError::Empty) => {
+                        // No work. Short sleep to avoid 100% CPU spin.
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(mpsc::error::TryRecvError::Disconnected) => {
+                        eprintln!("[slot_scheduler:native] admission closed; exiting driver");
+                        return;
+                    }
+                }
+                continue;
+            }
+
+            // 4) Build and execute one batch.
+            if let Err(e) = self.run_one_tick() {
+                eprintln!(
+                    "[slot_scheduler:native] tick {} failed: {}. Draining all active slots.",
+                    tick_counter, e,
+                );
+                self.drain_all_on_error(&e);
+            }
+
+            // 5) Optional idle throttle.
+            if self.tick_us > 0 {
+                std::thread::sleep(std::time::Duration::from_micros(self.tick_us));
+            }
+        }
+        eprintln!("[slot_scheduler:native] driver exited (shutdown flag set)");
+    }
+
+    /// Drain the admission queue into free slots (non-blocking).
+    fn admit_new(&mut self) {
+        loop {
+            // Peek capacity — if no free slot, break.
+            if self.pool.alloc_free().is_none() {
+                break;
+            }
+            // Try to pull one req. Non-blocking.
+            let req = match self.rx.try_recv() {
+                Ok(r) => r,
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    // All senders dropped → shutdown triggered by server stop.
+                    self.shutdown.store(true, Ordering::SeqCst);
+                    return;
+                }
+            };
+            self.seat_request(req);
+        }
+    }
+
+    /// Seat a new request in the first free slot. Caller MUST have
+    /// verified a free slot is available via `alloc_free().is_some()`.
+    fn seat_request(&mut self, req: NativeScheduledRequest) {
+        // Defense: an empty prompt would cause `end-start-1` to underflow
+        // in `tick_prefill_one`. Reject loudly, don't silently hang.
+        if req.prompt_tokens.is_empty() {
+            let _ = req.tx.try_send(StreamMsg::Error {
+                message: "empty prompt tokens — rejecting".to_string(),
+            });
+            let _ = req.tx.try_send(StreamMsg::Done {
+                finish_reason: "error".to_string(),
+            });
+            return;
+        }
+        let free = match self.pool.alloc_free() {
+            Some(s) => s,
+            None => {
+                // Shouldn't happen given the caller's precondition, but
+                // defend by sending an Error and moving on.
+                let _ = req.tx.try_send(StreamMsg::Error {
+                    message: "No free slot after admission — race condition".to_string(),
+                });
+                return;
+            }
+        };
+        eprintln!(
+            "[slot_scheduler:native] seat req={} on slot {} (prompt={} toks, max={}, wait_ms={})",
+            req.request_id,
+            free.id,
+            req.prompt_tokens.len(),
+            req.params.max_tokens,
+            req.enqueued_at.elapsed().as_millis(),
+        );
+        // Reset slot to a clean state (defensive — mark_free was called
+        // when the previous tenant vacated).
+        free.mark_free();
+        free.state = SlotState::Prefilling { chunks_done: 0 };
+        free.pos = 0;
+        free.prompt_tokens = req.prompt_tokens;
+        free.params = req.params;
+        free.engram_alpha = req.engram_alpha;
+        free.tx = Some(req.tx);
+        free.want_logprobs = req.want_logprobs;
+        free.request_id = req.request_id;
+        free.cancelled = req.cancelled;
+        free.thinking = free.params.enable_thinking;
+        free.stats.prompt_tokens = free.prompt_tokens.len() as u32;
+        // Seed the recent_context with the prompt tail for engram lookups.
+        // We push the whole prompt so the first gen step's engram query
+        // has full context; Slot::push_context bounds the window to 256.
+        let prompt_tokens_clone = free.prompt_tokens.clone();
+        for t in prompt_tokens_clone {
+            free.push_context(t);
+        }
+    }
+
+    /// One scheduler tick: build + execute + sample.
+    fn run_one_tick(&mut self) -> Result<(), String> {
+        // Collect per-slot actions first. We need to borrow slots mutably
+        // below when applying sampling results, so we avoid a longer-lived
+        // &mut iter by snapshotting action decisions into Vec<(u32, Action)>.
+        //
+        // Two tick flavours, mutually exclusive (qwen3next constraint,
+        // see j4-smoke module doc):
+        //   A) Any slot in Prefilling → push one prefill chunk for ONE slot
+        //      (prefer the slot with fewest chunks_done for FIFO-ish).
+        //   B) All active slots in Generating → push one gen token per slot.
+        let has_prefill = self.pool.all_mut().any(|s| {
+            matches!(s.state, SlotState::Prefilling { .. })
+        });
+
+        if has_prefill {
+            self.tick_prefill_one()
+        } else {
+            self.tick_generate_all()
+        }
+    }
+
+    /// Tick type A: push one prefill chunk for one Prefilling slot.
+    ///
+    /// Selects the slot whose `chunks_done` is the smallest (tie-breaker:
+    /// lowest `id`). Pushes up to `max_prefill_chunk` tokens in a single
+    /// `forward_multi_seq` call. On the final chunk, also samples the
+    /// first generate token and transitions the slot to `Generating`.
+    fn tick_prefill_one(&mut self) -> Result<(), String> {
+        // Find the target slot.
+        let slot_id = {
+            let mut best: Option<(u32, usize)> = None; // (id, chunks_done)
+            for s in self.pool.all_mut() {
+                if let SlotState::Prefilling { chunks_done } = s.state {
+                    let cand = (s.id, chunks_done);
+                    match best {
+                        None => best = Some(cand),
+                        Some((_, bcd)) if chunks_done < bcd => best = Some(cand),
+                        _ => {}
+                    }
+                }
+            }
+            best.map(|(id, _)| id).ok_or_else(|| {
+                "tick_prefill_one: no Prefilling slot — caller bug".to_string()
+            })?
+        };
+
+        // Snapshot the prefill chunk we'll push.
+        let (chunk_entries, is_last_chunk, starting_pos): (
+            Vec<crate::llama_backend::MultiSeqEntry>,
+            bool,
+            i32,
+        ) = {
+            let slot = self.pool.get_mut(slot_id).unwrap();
+            let chunks_done = match slot.state {
+                SlotState::Prefilling { chunks_done } => chunks_done,
+                _ => unreachable!(),
+            };
+            let start = chunks_done * self.max_prefill_chunk;
+            let end = (start + self.max_prefill_chunk).min(slot.prompt_tokens.len());
+            let is_last = end == slot.prompt_tokens.len();
+            let abs_pos_start = start as i32;
+
+            let mut entries: Vec<crate::llama_backend::MultiSeqEntry> =
+                Vec::with_capacity(end - start);
+            for (i, &tok) in slot.prompt_tokens[start..end].iter().enumerate() {
+                let abs_pos = abs_pos_start + i as i32;
+                let want_logits = is_last && (i == (end - start - 1));
+                entries.push(crate::llama_backend::MultiSeqEntry {
+                    token: tok,
+                    pos: abs_pos,
+                    seq_id: slot.id as i32,
+                    request_logits: want_logits,
+                });
+            }
+            (entries, is_last, abs_pos_start)
+        };
+
+        let n_entries = chunk_entries.len();
+        let out = self.llama.forward_multi_seq(&chunk_entries)?;
+
+        // Update slot state.
+        let slot = self.pool.get_mut(slot_id).unwrap();
+        let (new_chunks_done, transition_to_gen) = if let SlotState::Prefilling { chunks_done } = slot.state {
+            (chunks_done + 1, is_last_chunk)
+        } else {
+            return Err(format!("slot {} left Prefilling mid-tick", slot_id));
+        };
+        slot.pos = starting_pos + n_entries as i32;
+
+        if !transition_to_gen {
+            slot.state = SlotState::Prefilling { chunks_done: new_chunks_done };
+            return Ok(());
+        }
+
+        // Last chunk — sample first gen token and transition.
+        if !out.iter().any(|(s, _)| *s == slot.id as i32) {
+            return Err(format!(
+                "tick_prefill_one: no logits returned for seq_id {}",
+                slot.id
+            ));
+        }
+        // The logits position in the returned Vec matches the batch idx.
+        // Since we only requested logits for ONE entry (last token of
+        // last chunk), the sampler must use batch_idx = n_entries - 1.
+        let batch_idx = n_entries - 1;
+
+        // Apply per-slot engram bias before sampling. Then release the
+        // mutable borrow by extracting the raw sampler pointer (still
+        // owned by the slot, not freed) before calling self.llama.
+        slot.apply_engram_bias_to_sampler();
+        let sampler_raw: Option<*mut std::ffi::c_void> = slot
+            .sampler
+            .as_ref()
+            .filter(|s| s.is_active())
+            .map(|s| unsafe { s.as_raw() });
+        // end the `slot` borrow; re-fetch after FFI.
+        let _ = slot;
+
+        // Sample with per-slot sampler + logprobs.
+        let (tok, _logprobs) = match sampler_raw {
+            Some(raw) => unsafe {
+                self.llama.sample_slot_with_logprobs(raw, batch_idx)
+            },
+            None => {
+                // No sampler → argmax fallback. Shouldn't happen in prod.
+                let logits = self.llama.get_logits_at(batch_idx).ok_or_else(|| {
+                    format!("null logits at batch_idx {} in prefill fallthrough", batch_idx)
+                })?;
+                let tok = argmax_u32(logits);
+                (tok, Vec::new())
+            }
+        };
+
+        self.emit_sampled_token(slot_id, tok);
+
+        let slot = self.pool.get_mut(slot_id).unwrap();
+        if !matches!(slot.state, SlotState::Draining) {
+            slot.state = SlotState::Generating;
+        }
+        Ok(())
+    }
+
+    /// Tick type B: one gen token per Generating slot, all in the same
+    /// `forward_multi_seq` batch (distinct seq_ids).
+    fn tick_generate_all(&mut self) -> Result<(), String> {
+        // Collect (slot_id, last_token, pos) for every Generating slot.
+        let gen_inputs: Vec<(u32, u32, i32)> = self
+            .pool
+            .all_mut()
+            .filter_map(|s| {
+                if !matches!(s.state, SlotState::Generating) {
+                    return None;
+                }
+                // The last-token is either last in .generated or the last
+                // prompt token if no tokens have been generated yet (should
+                // not happen because prefill already produced the first
+                // gen token during tick_prefill_one).
+                let last_tok = *s.generated.last().unwrap_or(s.prompt_tokens.last().unwrap_or(&0));
+                Some((s.id, last_tok, s.pos))
+            })
+            .collect();
+
+        if gen_inputs.is_empty() {
+            return Ok(());
+        }
+
+        let entries: Vec<crate::llama_backend::MultiSeqEntry> = gen_inputs
+            .iter()
+            .map(|&(slot_id, tok, pos)| crate::llama_backend::MultiSeqEntry {
+                token: tok,
+                pos,
+                seq_id: slot_id as i32,
+                request_logits: true,
+            })
+            .collect();
+
+        let _out = self.llama.forward_multi_seq(&entries)?;
+
+        // Per-slot apply_bias → sample → emit. Batch index matches input order.
+        for (batch_idx, &(slot_id, _tok, _pos)) in gen_inputs.iter().enumerate() {
+            // Fetch slot fresh each iteration (can't hold &mut across loop
+            // with other slots touching the same pool).
+            if let Some(slot) = self.pool.get_mut(slot_id) {
+                slot.apply_engram_bias_to_sampler();
+            }
+
+            let sampler_raw = self
+                .pool
+                .get_mut(slot_id)
+                .and_then(|s| s.sampler.as_ref().map(|h| unsafe { h.as_raw() }));
+            let (tok, _logprobs) = match sampler_raw {
+                Some(raw) if !raw.is_null() => unsafe {
+                    self.llama.sample_slot_with_logprobs(raw, batch_idx)
+                },
+                _ => {
+                    // Argmax fallback.
+                    let raw = self.llama.get_logits_at(batch_idx).ok_or_else(|| {
+                        format!("null logits at batch_idx {}", batch_idx)
+                    })?;
+                    let tok = argmax_u32(raw);
+                    (tok, Vec::new())
+                }
+            };
+
+            self.emit_sampled_token(slot_id, tok);
+
+            // Post-sample: advance pos, check stop/length.
+            if let Some(slot) = self.pool.get_mut(slot_id) {
+                if matches!(slot.state, SlotState::Draining) {
+                    continue;
+                }
+                slot.pos += 1;
+                if slot.stats.generated_tokens >= slot.params.max_tokens {
+                    slot.mark_draining("length");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Push `tok` into the slot (bookkeeping), decode text, emit via try_emit.
+    /// Handles stop_tokens, `</think>` flip, client-disconnect in one place.
+    fn emit_sampled_token(&mut self, slot_id: u32, tok: u32) {
+        let slot = match self.pool.get_mut(slot_id) {
+            Some(s) => s,
+            None => return,
+        };
+        slot.generated.push(tok);
+        slot.push_context(tok);
+        slot.stats.generated_tokens = slot.stats.generated_tokens.saturating_add(1);
+
+        // On-token housekeeping: thinking flip, stop tokens.
+        let was_thinking = slot.thinking;
+        let cont = slot.on_token_sampled(tok);
+
+        // Decode token to text. We use the simplest possible bytes→utf8
+        // approach by delegating to libllama's `token_to_piece`. The
+        // driver thread owns `llama` so this is safe.
+        let text = self.llama.token_to_piece(tok as i32, false).unwrap_or_default();
+
+        // Build the StreamMsg. Note the semantics from J6:
+        //   - When was_thinking=true AND tok==THINK_END (so cont=true unless
+        //     stop list also contained it): emit as Thinking (user-visible
+        //     </think> stays in reasoning block).
+        //   - Otherwise: emit as Token or Thinking based on current flag.
+        let msg = if was_thinking {
+            StreamMsg::Thinking { text }
+        } else {
+            StreamMsg::Token { text, logprob: None }
+        };
+
+        // Try to emit. On client disconnect (Closed), mark_draining("cancel").
+        let emit_ok = slot.try_emit(msg);
+        if !emit_ok {
+            slot.mark_draining("cancel");
+            return;
+        }
+
+        // Honour the cancellation flag set by the HTTP handler (e.g. if
+        // axum observed the client TCP-dropping before our try_send).
+        if slot.cancelled.load(Ordering::SeqCst) {
+            slot.mark_draining("cancel");
+            return;
+        }
+
+        if !cont {
+            slot.mark_draining("stop");
+        }
+    }
+
+    /// Reap every Draining slot: emit exactly one Done frame, release KV
+    /// pages for the seq_id, mark the slot Free.
+    fn reap_draining(&mut self) {
+        // Collect ids first to avoid borrow conflicts with llama kv_cache call.
+        let draining_ids: Vec<(u32, String)> = self
+            .pool
+            .all_mut()
+            .filter_map(|s| {
+                if matches!(s.state, SlotState::Draining) {
+                    let reason = s.finish_reason.clone().unwrap_or_else(|| "stop".to_string());
+                    Some((s.id, reason))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (slot_id, reason) in draining_ids {
+            // Emit Done (best-effort — client may have dropped already).
+            if let Some(slot) = self.pool.get_mut(slot_id) {
+                let _ = slot.try_emit(StreamMsg::Done {
+                    finish_reason: reason.clone(),
+                });
+            }
+            // Free KV/SSM state for this seq_id.
+            let _ = self.llama.kv_cache_seq_rm_for(slot_id as i32);
+            // Mark slot free (also clears sampler state + recent_context).
+            if let Some(slot) = self.pool.get_mut(slot_id) {
+                slot.mark_free();
+            }
+        }
+    }
+
+    /// Propagate a fatal tick error to every active slot: emit Error +
+    /// Done("error"), release KV pages.
+    fn drain_all_on_error(&mut self, err: &str) {
+        let active_ids: Vec<u32> = self
+            .pool
+            .all_mut()
+            .filter(|s| !s.is_free())
+            .map(|s| s.id)
+            .collect();
+        for slot_id in active_ids {
+            if let Some(slot) = self.pool.get_mut(slot_id) {
+                let _ = slot.try_emit(StreamMsg::Error {
+                    message: err.to_string(),
+                });
+                slot.mark_draining("error");
+            }
+            let _ = self.llama.kv_cache_seq_rm_for(slot_id as i32);
+            if let Some(slot) = self.pool.get_mut(slot_id) {
+                let _ = slot.try_emit(StreamMsg::Done {
+                    finish_reason: "error".to_string(),
+                });
+                slot.mark_free();
+            }
+        }
+    }
+}
+
+/// Internal greedy argmax over a logit slice. Fallback path for when the
+/// per-slot sampler is not allocated.
+fn argmax_u32(logits: &[f32]) -> u32 {
+    let mut best_idx: u32 = 0;
+    let mut best_val = f32::MIN;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best_idx = i as u32;
+        }
+    }
+    best_idx
+}
+
 // ---------------------------------------------------------------------------
 // Tests — J1 only verifies types compile and the pool bookkeeping works.
 // ---------------------------------------------------------------------------
@@ -1057,6 +1787,7 @@ mod tests {
         assert_eq!(NUM_SLOTS_DEFAULT, 1);
         let cfg = SchedulerConfig::default();
         assert!(!cfg.is_active());
+        assert!(!cfg.is_native());
         assert_eq!(cfg.num_slots, 1);
     }
 
@@ -1072,7 +1803,7 @@ mod tests {
 
     #[test]
     fn scheduler_admission_tx_clone_ok() {
-        let cfg = SchedulerConfig { num_slots: 2, queue_cap: 4, enabled: true };
+        let cfg = SchedulerConfig { num_slots: 2, queue_cap: 4, enabled: true, native: false };
         let sched = Scheduler::new(cfg);
         assert!(sched.is_active());
         let tx1 = sched.admission_tx();
@@ -1242,5 +1973,46 @@ mod tests {
         s.mark_draining("cancel");
         assert!(s.is_draining());
         assert_eq!(s.finish_reason.as_deref(), Some("stop"));
+    }
+
+    // ----------------------------------------------------------------
+    // J4-rewrite — NativeScheduler invariants (unit, no FFI)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn j4rw_native_config_requires_multislot_env() {
+        // Without CHIMERE_MULTISLOT>=2 the native flag is silently ignored.
+        // We assert on the struct directly since env-setting in tests is
+        // global mutation and racy.
+        let cfg_legacy = SchedulerConfig {
+            num_slots: 1, queue_cap: 4, enabled: false, native: false,
+        };
+        let err = NativeScheduler::new(cfg_legacy, None, 0.8).unwrap_err();
+        assert!(err.contains("CHIMERE_MULTISLOT"));
+
+        let cfg_j2_only = SchedulerConfig {
+            num_slots: 2, queue_cap: 4, enabled: true, native: false,
+        };
+        let err = NativeScheduler::new(cfg_j2_only, None, 0.8).unwrap_err();
+        assert!(err.contains("native="));
+    }
+
+    #[test]
+    fn j4rw_native_active_when_both_flags_set() {
+        let cfg = SchedulerConfig {
+            num_slots: 2, queue_cap: 8, enabled: true, native: true,
+        };
+        let sched = NativeScheduler::new(cfg, None, 0.0).unwrap();
+        assert!(sched.is_active());
+        let tx = sched.admission_tx();
+        assert_eq!(tx.capacity(), 8);
+    }
+
+    #[test]
+    fn j4rw_argmax_fallback_on_empty_is_zero() {
+        // edge case: argmax over an empty logits slice returns the default 0
+        // (would NaN-crash only if we dereferenced; we don't).
+        assert_eq!(argmax_u32(&[]), 0);
+        assert_eq!(argmax_u32(&[0.1, 0.2, 0.9, 0.3]), 2);
     }
 }

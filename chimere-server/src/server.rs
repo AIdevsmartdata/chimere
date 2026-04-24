@@ -43,7 +43,12 @@ use crate::generate::{generate_text, generate_text_generic};
 use crate::generic_model::GenericModel;
 use crate::mtp_scheduler::{SamplingParams, generate_with_mtp_streaming};
 use crate::qwen35_model::Qwen35Model;
-use crate::slot_scheduler::{ScheduledRequest, ScheduledRequestMeta, Scheduler};
+use crate::slot_scheduler::{
+    NativeScheduledRequest, NativeScheduler,
+    ScheduledRequest, ScheduledRequestMeta, Scheduler,
+    SamplingParams as NativeSamplingParams,
+    StreamMsg as NativeStreamMsg,
+};
 use crate::state::GdnRecurrentState;
 
 // ---------------------------------------------------------------------------
@@ -310,6 +315,14 @@ impl AppStateModel {
 pub struct AppState {
     /// Model is behind a Mutex because the inner types are !Sync (RefCell).
     /// The mutex also serialises inference — one request at a time.
+    ///
+    /// J4-rewrite note: when `native_scheduler` is armed, the `LlamaForward`
+    /// that used to live inside `Qwen35Model::llama_forward` has been
+    /// extracted and handed to the scheduler's driver thread. The
+    /// `AppStateModel` still exists (to keep the Qwen35Model Candle path
+    /// available for the non-streaming legacy path), but its
+    /// `llama_forward_active()` returns `false`. Callers that hit the
+    /// native path never lock this Mutex.
     pub model: Mutex<AppStateModel>,
     pub tokenizer: Arc<Tokenizer>,
     pub model_name: String,
@@ -319,20 +332,31 @@ pub struct AppState {
     pub user_agent_map: Mutex<std::collections::HashMap<String, usize>>,
     /// Max agents (from env CHIMERE_MAX_AGENTS, default 4).
     pub max_agents: usize,
-    /// M1 J2 multi-slot scheduler. `None` in legacy single-slot mode
-    /// (the default when `CHIMERE_MULTISLOT` is unset or `1`). When `Some`,
-    /// HTTP handlers route the inference closure through the admission
-    /// queue instead of spawning the compute thread directly.
+    /// M1 J2 multi-slot scheduler (closure-based, legacy). `None` in legacy
+    /// single-slot mode (the default when `CHIMERE_MULTISLOT` is unset or
+    /// `1`). When `Some`, HTTP handlers route the inference closure through
+    /// the admission queue instead of spawning the compute thread directly.
     ///
     /// The scheduler is armed at process startup in
     /// `bin/chimere-server.rs` and lives for the process lifetime.
     pub scheduler: Option<Arc<Scheduler>>,
+    /// M1 J4-rewrite — native multi-slot scheduler owning `LlamaForward`.
+    /// `Some` iff `CHIMERE_MULTISLOT>=2 AND CHIMERE_MULTISLOT_NATIVE=1`.
+    /// Takes priority over `scheduler` in the handler routing when both
+    /// are `Some`.
+    pub native_scheduler: Option<Arc<NativeScheduler>>,
 }
 
 impl AppState {
-    /// `true` when the multi-slot admission path is enabled.
+    /// `true` when the multi-slot admission path (closure-based J2) is enabled.
     pub fn multislot_active(&self) -> bool {
         self.scheduler.as_ref().map(|s| s.is_active()).unwrap_or(false)
+    }
+
+    /// `true` when the J4-rewrite native path is armed. Takes priority over
+    /// `multislot_active` for SSE streaming requests in the handler.
+    pub fn native_multislot_active(&self) -> bool {
+        self.native_scheduler.as_ref().map(|s| s.is_active()).unwrap_or(false)
     }
 }
 
@@ -742,6 +766,25 @@ async fn chat_completions_non_stream(
     state: Arc<AppState>,
     req: ChatRequest,
 ) -> impl IntoResponse {
+    // TODO(verify-1): when native_multislot_active is true, the
+    // underlying LlamaForward has been transferred OUT of the Qwen35Model
+    // wrapped in `state.model`. Calling into `run_inference` will fail
+    // with "llama_forward not initialized" for Qwen35. For M1 we reject
+    // non-streaming requests in native mode with a 503 — this matches
+    // the "Native mode is streaming-first" constraint documented in
+    // README.md. The alternative (collect SSE → JSON adapter) is an M2
+    // stretch goal.
+    if state.native_multislot_active() {
+        let body = serde_json::json!({
+            "error": {
+                "message": "Non-streaming requests are not supported when CHIMERE_MULTISLOT_NATIVE=1. Set stream=true on the request, or disable native mode.",
+                "type": "unsupported_mode",
+                "code": "native_mode_streaming_only"
+            }
+        });
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+    }
+
     let enable_thinking = req.chat_template_kwargs
         .as_ref()
         .map(|k| k.enable_thinking)
@@ -1390,6 +1433,270 @@ async fn chat_completions_stream(
     Sse::new(sse_stream)
 }
 
+// ===========================================================================
+// J4-rewrite — NATIVE streaming SSE path
+//
+// When `state.native_scheduler.is_some() && sched.is_active()`, streaming
+// requests are handled by the NativeScheduler instead of the J2 closure
+// dispatcher. The request path is:
+//   HTTP → tokenize → NativeScheduledRequest → admission mpsc → driver →
+//   forward_multi_seq → per-slot StreamMsg → per-request rx → SSE
+//
+// Uses a DIFFERENT StreamMsg type (`slot_scheduler::StreamMsg`) than the
+// legacy path's inner `enum StreamMsg` above — the native path doesn't
+// share the legacy `Thinking(String)` / `Token(String, Option<LogprobContent>)`
+// shape. We translate on the SSE-building side.
+// ===========================================================================
+
+/// Build a NativeSamplingParams from a ChatRequest. Mirrors the legacy
+/// `SamplingParams` build but targets the scheduler module's struct.
+fn native_sampling_params_from_req(req: &ChatRequest) -> NativeSamplingParams {
+    let enable_thinking = req.chat_template_kwargs
+        .as_ref()
+        .map(|k| k.enable_thinking)
+        .unwrap_or(true);
+    NativeSamplingParams {
+        temperature: req.temperature as f32,
+        top_p: req.top_p as f32,
+        top_k: req.top_k as u32,
+        min_p: 0.05,
+        presence_penalty: req.presence_penalty as f32,
+        max_tokens: req.max_tokens.min(MAX_TOKENS_LIMIT) as u32,
+        stop_tokens: Vec::new(), // reserved for M2; clients pass via req.stop (not yet wired)
+        enable_thinking,
+    }
+}
+
+/// Native SSE streaming path — the J4-rewrite handler.
+async fn chat_completions_native_stream(
+    state: Arc<AppState>,
+    req: ChatRequest,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let model_name = state.model_name.clone();
+    let req_id = new_request_id();
+    let created = unix_now();
+
+    let enable_thinking = req.chat_template_kwargs
+        .as_ref()
+        .map(|k| k.enable_thinking)
+        .unwrap_or(true);
+    let prompt = messages_to_prompt(&req.messages, req.tools.as_ref(), enable_thinking);
+
+    // Tokenize on the HTTP task (the Tokenizer is Arc, no lock contention).
+    let prompt_tokens: Vec<u32> = match state.tokenizer.encode(prompt.as_str(), false) {
+        Ok(enc) => enc.get_ids().to_vec(),
+        Err(_e) => Vec::new(),
+    };
+
+    let params = native_sampling_params_from_req(&req);
+    let engram_alpha = req.engram_alpha.unwrap_or(0.0) as f32;
+
+    // Per-request channel (native StreamMsg).
+    let (tx, rx) = tokio::sync::mpsc::channel::<NativeStreamMsg>(128);
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    // Route: send the NativeScheduledRequest.
+    let native_sched = state.native_scheduler.as_ref().cloned();
+    let tx_for_admission = tx.clone();
+    let req_id_clone = req_id.clone();
+    let admission_ok = if let Some(sched) = native_sched {
+        let admission_tx = sched.admission_tx();
+        let native_req = NativeScheduledRequest {
+            request_id: req_id_clone,
+            prompt_tokens,
+            params,
+            engram_alpha,
+            engram_hint: None,
+            tx: tx_for_admission,
+            want_logprobs: req.logprobs,
+            top_logprobs_n: req.top_logprobs.unwrap_or(5).min(5),
+            enable_thinking,
+            cancelled: Arc::clone(&cancelled),
+            enqueued_at: std::time::Instant::now(),
+        };
+        admission_tx.send(native_req).await.is_ok()
+    } else {
+        false
+    };
+
+    if !admission_ok {
+        let _ = tx
+            .send(NativeStreamMsg::Error {
+                message: "Native scheduler admission failed — server shutdown?".to_string(),
+            })
+            .await;
+        let _ = tx
+            .send(NativeStreamMsg::Done {
+                finish_reason: "error".to_string(),
+            })
+            .await;
+    }
+
+    // SSE unfold state (native variant).
+    struct NativeSseState {
+        rx: tokio::sync::mpsc::Receiver<NativeStreamMsg>,
+        req_id: String,
+        model_name: String,
+        created: u64,
+        sent_role: bool,
+        finished: bool,
+    }
+
+    let initial_state = NativeSseState {
+        rx,
+        req_id,
+        model_name,
+        created,
+        sent_role: false,
+        finished: false,
+    };
+
+    let sse_stream = stream::unfold(initial_state, |mut st| async move {
+        if st.finished {
+            return None;
+        }
+        if !st.sent_role {
+            st.sent_role = true;
+            let role_chunk = ChatChunk {
+                id: st.req_id.clone(),
+                object: "chat.completion.chunk".into(),
+                created: st.created,
+                model: st.model_name.clone(),
+                choices: vec![ChunkChoice {
+                    index: 0,
+                    delta: Delta {
+                        role: Some("assistant".into()),
+                        content: None,
+                        reasoning_content: None,
+                    },
+                    finish_reason: None,
+                    logprobs: None,
+                }],
+            };
+            let data = serde_json::to_string(&role_chunk).unwrap_or_default();
+            let evt: Result<Event, Infallible> = Ok(Event::default().data(data));
+            return Some((evt, st));
+        }
+
+        match st.rx.recv().await {
+            Some(NativeStreamMsg::Token { text, logprob: _ }) => {
+                let chunk = ChatChunk {
+                    id: st.req_id.clone(),
+                    object: "chat.completion.chunk".into(),
+                    created: st.created,
+                    model: st.model_name.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: Delta {
+                            role: None,
+                            content: Some(text),
+                            reasoning_content: None,
+                        },
+                        finish_reason: None,
+                        logprobs: None,
+                    }],
+                };
+                let data = serde_json::to_string(&chunk).unwrap_or_default();
+                let evt: Result<Event, Infallible> = Ok(Event::default().data(data));
+                Some((evt, st))
+            }
+            Some(NativeStreamMsg::Thinking { text }) => {
+                let chunk = ChatChunk {
+                    id: st.req_id.clone(),
+                    object: "chat.completion.chunk".into(),
+                    created: st.created,
+                    model: st.model_name.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: Delta {
+                            role: None,
+                            content: None,
+                            reasoning_content: Some(text),
+                        },
+                        finish_reason: None,
+                        logprobs: None,
+                    }],
+                };
+                let data = serde_json::to_string(&chunk).unwrap_or_default();
+                let evt: Result<Event, Infallible> = Ok(Event::default().data(data));
+                Some((evt, st))
+            }
+            Some(NativeStreamMsg::ToolCall { json }) => {
+                // Emit as a plain content chunk for now (matching J2's
+                // current behaviour — tool-call parsing is handled client-side).
+                let chunk = ChatChunk {
+                    id: st.req_id.clone(),
+                    object: "chat.completion.chunk".into(),
+                    created: st.created,
+                    model: st.model_name.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: Delta {
+                            role: None,
+                            content: Some(json),
+                            reasoning_content: None,
+                        },
+                        finish_reason: None,
+                        logprobs: None,
+                    }],
+                };
+                let data = serde_json::to_string(&chunk).unwrap_or_default();
+                let evt: Result<Event, Infallible> = Ok(Event::default().data(data));
+                Some((evt, st))
+            }
+            Some(NativeStreamMsg::Done { finish_reason }) => {
+                let stop_chunk = ChatChunk {
+                    id: st.req_id.clone(),
+                    object: "chat.completion.chunk".into(),
+                    created: st.created,
+                    model: st.model_name.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: Delta {
+                            role: None,
+                            content: None,
+                            reasoning_content: None,
+                        },
+                        finish_reason: Some(finish_reason),
+                        logprobs: None,
+                    }],
+                };
+                let data = serde_json::to_string(&stop_chunk).unwrap_or_default();
+                let evt: Result<Event, Infallible> = Ok(Event::default().data(data));
+                Some((evt, st))
+            }
+            Some(NativeStreamMsg::Error { message }) => {
+                let err_chunk = ChatChunk {
+                    id: st.req_id.clone(),
+                    object: "chat.completion.chunk".into(),
+                    created: st.created,
+                    model: st.model_name.clone(),
+                    choices: vec![ChunkChoice {
+                        index: 0,
+                        delta: Delta {
+                            role: None,
+                            content: Some(format!("\n\n[Error: {}]", message)),
+                            reasoning_content: None,
+                        },
+                        finish_reason: None,
+                        logprobs: None,
+                    }],
+                };
+                let data = serde_json::to_string(&err_chunk).unwrap_or_default();
+                let evt: Result<Event, Infallible> = Ok(Event::default().data(data));
+                Some((evt, st))
+            }
+            None => {
+                st.finished = true;
+                let evt: Result<Event, Infallible> = Ok(Event::default().data("[DONE]"));
+                Some((evt, st))
+            }
+        }
+    });
+
+    Sse::new(sse_stream)
+}
+
 // ---------------------------------------------------------------------------
 // Unified handler: dispatch to streaming or non-streaming
 // ---------------------------------------------------------------------------
@@ -1399,7 +1706,12 @@ async fn chat_completions_handler(
     Json(req): Json<ChatRequest>,
 ) -> axum::response::Response {
     if req.stream {
-        chat_completions_stream(state, req).await.into_response()
+        // J4-rewrite: native path takes priority over J2 closure path.
+        if state.native_multislot_active() {
+            chat_completions_native_stream(state, req).await.into_response()
+        } else {
+            chat_completions_stream(state, req).await.into_response()
+        }
     } else {
         chat_completions_non_stream(state, req).await.into_response()
     }
