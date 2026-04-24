@@ -47,6 +47,15 @@ name = "j2-smoke"
 path = "src/bin/j2_smoke.rs"
 required-features = ["server"]
 
+# M1 J3 smoke test — real FFI multi-seq decode, 2 concurrent sequences.
+# Exercises LlamaForward::forward_multi_seq and proves seq-isolation at
+# the llama_decode level. Needs a model (CHIMERE_MODEL env) but defaults
+# to n_gpu_layers=0 (CPU) so prod chimere-server's VRAM is not disturbed.
+[[bin]]
+name = "j3-smoke"
+path = "src/bin/j3_smoke.rs"
+required-features = ["server"]
+
 [profile.release]
 opt-level = 3
 lto = "fat"

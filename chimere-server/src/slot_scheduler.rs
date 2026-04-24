@@ -493,7 +493,7 @@ impl Scheduler {
     /// one OS thread, N logical slots, round-robin batch assembly, single
     /// FFI call per step producing one token per active slot.
     pub fn spawn_workers(&mut self) -> Vec<std::thread::JoinHandle<()>> {
-        let mut rx = match self.admission_rx.take() {
+        let mut rx: mpsc::Receiver<ScheduledRequest> = match self.admission_rx.take() {
             Some(rx) => rx,
             None => {
                 eprintln!("[slot_scheduler] spawn_workers called twice; ignoring.");

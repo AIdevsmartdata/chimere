@@ -233,6 +233,21 @@ pub struct TokenLogprob {
     pub logprob: f32,
 }
 
+/// Per-sequence entry for [`LlamaForward::forward_multi_seq`] (M1 J3).
+///
+/// Each entry represents one token to feed into the batch, tagged with the
+/// `seq_id` it belongs to and the position within that sequence. Set
+/// `request_logits = true` on the entries whose output the caller needs
+/// (typically the last token of a prefill chunk, or every generate-step
+/// token).
+#[derive(Debug, Clone, Copy)]
+pub struct MultiSeqEntry {
+    pub token: u32,
+    pub pos: i32,
+    pub seq_id: i32,
+    pub request_logits: bool,
+}
+
 // ggml_type constants we need for KV cache type specification
 #[allow(dead_code)]
 const GGML_TYPE_F16: i32 = 1;
@@ -383,6 +398,74 @@ extern "C" {
 }
 
 // ---------------------------------------------------------------------------
+// M1 J3 — per-slot sampler allocation helpers (thin safe wrappers)
+// ---------------------------------------------------------------------------
+
+/// Allocate a fresh C++ sampler handle bound to `model`, using the same
+/// Qwen3.5 tuned defaults as `LlamaForward::new`'s built-in sampler.
+///
+/// Used by `crate::multi_seq::MultiSeqDriver` at boot to allocate one
+/// independent sampler per slot so that each concurrent request has its
+/// own logit-bias / DRY history / repetition state.
+///
+/// # Safety
+/// `model` must be a valid pointer obtained from `LlamaForward::model_raw`
+/// and must remain valid for the lifetime of the returned handle. The
+/// caller is responsible for calling [`chimere_sampler_free_handle`] on
+/// every returned non-null pointer to avoid leaking C++ state.
+pub unsafe fn chimere_sampler_alloc(
+    model: *const LlamaModel,
+    temperature: f32,
+    top_p: f32,
+    top_k: i32,
+    min_p: f32,
+    presence_penalty: f32,
+) -> *mut c_void {
+    chimere_sampler_init(
+        model,
+        temperature, top_p, top_k,
+        min_p, presence_penalty,
+        0.8,   // dry_multiplier — same defaults as `LlamaForward::new`
+        1.75,  // dry_base
+        2,     // dry_min_length
+        -1,    // dry_penalty_last_n
+    )
+}
+
+/// Free a sampler handle allocated by [`chimere_sampler_alloc`] or by the
+/// built-in constructor in `LlamaForward::new`.
+///
+/// # Safety
+/// `sampler` must be a valid pointer returned by
+/// `chimere_sampler_init / chimere_sampler_alloc`. Double-free is UB.
+pub unsafe fn chimere_sampler_free_handle(sampler: *mut c_void) {
+    if !sampler.is_null() {
+        chimere_sampler_free(sampler);
+    }
+}
+
+/// Reset a per-slot sampler (clear DRY/repetition history).
+///
+/// # Safety
+/// `sampler` must be a valid handle.
+pub unsafe fn chimere_sampler_reset_handle(sampler: *mut c_void) {
+    if !sampler.is_null() {
+        chimere_sampler_reset(sampler);
+    }
+}
+
+/// Clear the Engram biases attached to a per-slot sampler, preserving
+/// manual `-inf` biases (e.g. `</think>` suppression).
+///
+/// # Safety
+/// `sampler` must be a valid handle.
+pub unsafe fn chimere_sampler_clear_engram_bias_handle(sampler: *mut c_void) {
+    if !sampler.is_null() {
+        chimere_sampler_clear_engram_bias(sampler);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Safe wrapper
 // ---------------------------------------------------------------------------
 
@@ -422,6 +505,10 @@ impl LlamaForward {
     /// * `type_k` - KV cache key type (ggml_type, e.g. GGML_TYPE_Q8_0 = 8)
     /// * `type_v` - KV cache value type (ggml_type, e.g. GGML_TYPE_Q4_0 = 2)
     /// * `flash_attn` - Enable flash attention
+    ///
+    /// Single-sequence convenience wrapper over [`new_multi_seq`] with
+    /// `n_seq_max = 1`. All existing call sites that do not care about
+    /// multi-slot serving use this.
     pub fn new(
         model_path: &str,
         n_gpu_layers: i32,
@@ -430,6 +517,42 @@ impl LlamaForward {
         type_k: Option<i32>,
         type_v: Option<i32>,
         flash_attn: bool,
+    ) -> Result<Self, String> {
+        Self::new_multi_seq(
+            model_path,
+            n_gpu_layers,
+            n_ctx,
+            ncmoe,
+            type_k,
+            type_v,
+            flash_attn,
+            1,
+        )
+    }
+
+    /// Identical to [`new`] but also sets `cparams.n_seq_max` to the
+    /// requested value, making the libllama context ready to drive up to
+    /// `n_seq_max` concurrent sequences (M1 multi-slot, J3+).
+    ///
+    /// `n_seq_max = 1` is the production default and behaves exactly like
+    /// the pre-J3 [`new`] call. `n_seq_max >= 2` enables the multi-seq
+    /// driver path (see `crate::multi_seq`).
+    ///
+    /// # Arguments
+    /// Same as [`new`] plus:
+    /// * `n_seq_max` - Maximum number of distinct sequence IDs the context
+    ///   will serve concurrently. Recurrent/GDN models allocate one state
+    ///   per seq; transformer KV pages are tagged per seq.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_multi_seq(
+        model_path: &str,
+        n_gpu_layers: i32,
+        n_ctx: u32,
+        ncmoe: u32,
+        type_k: Option<i32>,
+        type_v: Option<i32>,
+        flash_attn: bool,
+        n_seq_max: u32,
     ) -> Result<Self, String> {
         // Initialize the llama backend (idempotent, safe to call multiple times)
         unsafe {
@@ -500,6 +623,11 @@ impl LlamaForward {
             .ok().and_then(|s| s.parse().ok()).unwrap_or(4096);
         cparams.n_ubatch = std::env::var("CHIMERE_UBATCH")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(512);
+        // M1 J3: expose concurrent-sequence count to libllama. Recurrent/GDN
+        // models allocate one SSM state per seq; transformer KV pages are
+        // tagged per seq. Clamped to >=1 so legacy callers (n_seq_max=1) are
+        // unchanged bit-for-bit.
+        cparams.n_seq_max = n_seq_max.max(1);
         cparams.n_threads = std::env::var("CHIMERE_THREADS")
             .ok().and_then(|s| s.parse().ok()).unwrap_or(14);
         cparams.n_threads_batch = std::env::var("CHIMERE_THREADS_BATCH")
@@ -516,6 +644,10 @@ impl LlamaForward {
         cparams.k_cache_hadamard = k_cache_hadamard;
         // Enable MTP in context params (needed for embeddings + logits buffer allocation)
         cparams.mtp = true;
+
+        // Save fields we want to log after the ctx init (cparams is moved
+        // into the FFI call so reading it after would borrow-after-move).
+        let logged_n_seq_max = cparams.n_seq_max;
 
         let ctx = unsafe { llama_init_from_model(model, cparams) };
         if ctx.is_null() {
@@ -538,9 +670,10 @@ impl LlamaForward {
         }
 
         eprintln!(
-            "[LLAMA_BACKEND] Context created: n_ctx={}, n_batch=4096, n_ubatch=512, \
-             flash_attn={}, type_k={}, type_v={}, k_cache_hadamard={}, n_vocab={}, mtp={}",
-            n_ctx, flash_attn,
+            "[LLAMA_BACKEND] Context created: n_ctx={}, n_seq_max={}, n_batch=4096, \
+             n_ubatch=512, flash_attn={}, type_k={}, type_v={}, k_cache_hadamard={}, \
+             n_vocab={}, mtp={}",
+            n_ctx, logged_n_seq_max, flash_attn,
             type_k.unwrap_or(GGML_TYPE_Q8_0),
             type_v.unwrap_or(GGML_TYPE_Q4_0),
             k_cache_hadamard,
@@ -708,6 +841,101 @@ impl LlamaForward {
     /// Advances pos by count.
     pub fn accept_draft_tokens(&mut self, count: usize) {
         self.pos += count as i32;
+    }
+
+    // ---------- M1 J3 — true multi-seq forward pass ----------
+    //
+    // Unlike [`forward_prefill`] / [`forward_token`], these entry points do
+    // NOT touch `self.pos`. Each slot/seq_id tracks its own position and
+    // passes it explicitly. A single `llama_decode` call handles N slots,
+    // each tagged with its own `seq_id` — KV pages are segregated by seq.
+
+    /// Decode one batch that mixes tokens from **multiple** sequences.
+    ///
+    /// This is the core primitive for M1 multi-slot serving: the scheduler
+    /// collects one token per active slot, tags each with the slot's
+    /// `seq_id`, and calls this once per scheduler step. The libllama
+    /// KV cache automatically routes K/V writes to per-seq pages
+    /// (transformer path) or to per-seq SSM states (GDN/Mamba path).
+    ///
+    /// # Preconditions
+    /// - Context was built with `new_multi_seq(n_seq_max)` where
+    ///   `n_seq_max > max(entry.seq_id)`. `new(...)` allocates n_seq_max=1
+    ///   and will reject entries with seq_id > 0.
+    /// - Positions per `seq_id` are monotonically increasing across calls
+    ///   (libllama does not reorder within a seq).
+    /// - `entries.len()` must be ≤ `cparams.n_batch`.
+    ///
+    /// # Returns
+    /// Logits (size `n_vocab`) for every entry where `request_logits=true`,
+    /// tagged with the corresponding `seq_id`. Order matches batch index,
+    /// which matches the order of `request_logits=true` entries in input.
+    ///
+    /// Entries with `request_logits=false` (e.g. all-but-last tokens of a
+    /// prefill chunk) are processed by the model but produce no output.
+    pub fn forward_multi_seq(
+        &mut self,
+        entries: &[MultiSeqEntry],
+    ) -> Result<Vec<(i32, Vec<f32>)>, String> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = entries.len() as i32;
+        // llama_batch_init's 3rd arg is `n_seq_max` per token, not total.
+        // Each entry carries exactly one seq_id, so 1 is correct here.
+        let mut batch = unsafe { llama_batch_init(n, 0, 1) };
+
+        unsafe {
+            batch.n_tokens = n;
+            for (i, e) in entries.iter().enumerate() {
+                *batch.token.add(i) = e.token as i32;
+                *batch.pos.add(i) = e.pos;
+                *batch.n_seq_id.add(i) = 1;
+                let seq_ptr = *batch.seq_id.add(i);
+                *seq_ptr = e.seq_id;
+                *batch.logits.add(i) = if e.request_logits { 1 } else { 0 };
+            }
+        }
+
+        let ret = unsafe { llama_decode(self.ctx, batch) };
+        if ret != 0 {
+            unsafe { llama_batch_free(batch); }
+            return Err(format!("llama_decode multi_seq failed: code {}", ret));
+        }
+
+        // Collect logits in batch order, only for the requested entries.
+        let mut result: Vec<(i32, Vec<f32>)> = Vec::new();
+        for (i, e) in entries.iter().enumerate() {
+            if !e.request_logits { continue; }
+            let logits_ptr = unsafe { llama_get_logits_ith(self.ctx, i as i32) };
+            if logits_ptr.is_null() {
+                unsafe { llama_batch_free(batch); }
+                return Err(format!(
+                    "null logits at batch idx {} seq_id {}",
+                    i, e.seq_id,
+                ));
+            }
+            let logits = unsafe { std::slice::from_raw_parts(logits_ptr, self.n_vocab) };
+            result.push((e.seq_id, logits.to_vec()));
+        }
+
+        unsafe { llama_batch_free(batch); }
+        Ok(result)
+    }
+
+    /// Release all KV cache pages (and SSM state, if recurrent) owned by
+    /// `seq_id`. Call when a slot finishes or the client disconnects.
+    ///
+    /// Safe to call on a seq_id with no allocated pages (no-op, returns
+    /// false).
+    pub fn kv_cache_seq_rm_for(&mut self, seq_id: i32) -> bool {
+        unsafe { llama_kv_cache_seq_rm(self.ctx, seq_id, -1, -1) }
+    }
+
+    /// Public `n_vocab` for callers that receive raw logits from
+    /// [`forward_multi_seq`] and need to slice them.
+    pub fn vocab_size(&self) -> usize {
+        self.n_vocab
     }
 
     /// Accept a token into the sampler's history (for DRY/repetition tracking).
@@ -1012,8 +1240,136 @@ impl LlamaForward {
 
     /// Remove KV cache entries for a position range [p0, p1).
     /// Used to undo rejected draft tokens from the attention KV cache.
+    ///
+    /// NOTE: hardcodes `seq_id=0` for the single-slot path. Multi-slot
+    /// callers must use [`kv_cache_seq_rm_seq`] to target a specific
+    /// sequence ID.
     pub fn kv_cache_seq_rm(&mut self, p0: i32, p1: i32) -> bool {
         unsafe { llama_kv_cache_seq_rm(self.ctx, 0, p0, p1) }
+    }
+
+    /// Multi-seq variant of [`kv_cache_seq_rm`]. Removes KV cache entries
+    /// for a specific sequence ID over a position range.
+    ///
+    /// Conventions (match ik_llama's `llama_kv_cache_seq_rm` C API):
+    /// - `seq_id < 0`: match any sequence
+    /// - `p0 < 0`: from position 0
+    /// - `p1 < 0`: to +inf
+    ///
+    /// For slot cleanup on request completion: call with `(slot.seq_id, 0, -1)`.
+    pub fn kv_cache_seq_rm_seq(&mut self, seq_id: i32, p0: i32, p1: i32) -> bool {
+        unsafe { llama_kv_cache_seq_rm(self.ctx, seq_id, p0, p1) }
+    }
+
+    /// M1 J3 multi-seq batch decode. Composes a single `llama_batch` from
+    /// an arbitrary per-token (seq_id, pos, want_logits) layout and invokes
+    /// `llama_decode` once.
+    ///
+    /// The returned `Vec` has one entry per input token, in input order,
+    /// giving the `batch_idx` that should be fed to [`sample_slot`] or
+    /// [`get_logits_at`] to retrieve that token's logits (or `None` if the
+    /// token did not request logits).
+    ///
+    /// # Arguments
+    /// * `tokens` - Slice of `(token_id, pos, seq_id, want_logits)` tuples.
+    ///   Must not exceed `cparams.n_batch`.
+    ///
+    /// # Returns
+    /// * `Ok(Vec<Option<usize>>)` - Per-token batch index for logits lookup,
+    ///   or `None` if the token did not request logits.
+    /// * `Err(String)` on libllama failure.
+    ///
+    /// # Safety notes
+    /// The caller is responsible for tracking each sequence's position
+    /// counter. This method does NOT mutate `self.pos` because in multi-seq
+    /// mode `self.pos` has no meaning (see `multi_seq::MultiSeqSlot.pos`).
+    pub fn forward_batch_multiseq(
+        &mut self,
+        tokens: &[(u32, i32, i32, bool)],
+    ) -> Result<Vec<Option<usize>>, String> {
+        if tokens.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let n = tokens.len() as i32;
+        // `n_seq_max=1`: each token only tagged with 1 seq ID. We do not
+        // currently use broadcast-to-many-seqs (that's a future speculative
+        // decoding feature).
+        let mut batch = unsafe { llama_batch_init(n, 0, 1) };
+
+        let mut logits_indices: Vec<Option<usize>> = Vec::with_capacity(tokens.len());
+
+        unsafe {
+            batch.n_tokens = n;
+            for (i, &(tok, pos, seq_id, want_logits)) in tokens.iter().enumerate() {
+                *batch.token.add(i) = tok as i32;
+                *batch.pos.add(i) = pos;
+                *batch.n_seq_id.add(i) = 1;
+                let seq_ptr = *batch.seq_id.add(i);
+                *seq_ptr = seq_id;
+                *batch.logits.add(i) = if want_logits { 1 } else { 0 };
+                logits_indices.push(if want_logits { Some(i) } else { None });
+            }
+        }
+
+        let ret = unsafe { llama_decode(self.ctx, batch) };
+        if ret != 0 {
+            unsafe { llama_batch_free(batch); }
+            return Err(format!(
+                "llama_decode (multi-seq) failed with code {} for n_tokens={}",
+                ret, n
+            ));
+        }
+
+        unsafe { llama_batch_free(batch); }
+        Ok(logits_indices)
+    }
+
+    /// Retrieve logits for the token at batch index `i` from the most
+    /// recent `forward_batch_multiseq` call.
+    ///
+    /// Returns a borrowed slice into libllama's internal buffer — valid
+    /// only until the next `llama_decode` call. Caller must clone if
+    /// longer-lived storage is needed.
+    pub fn get_logits_at(&self, batch_idx: usize) -> Option<&[f32]> {
+        let ptr = unsafe { llama_get_logits_ith(self.ctx, batch_idx as i32) };
+        if ptr.is_null() {
+            return None;
+        }
+        Some(unsafe { std::slice::from_raw_parts(ptr, self.n_vocab) })
+    }
+
+    /// Raw context pointer — used by multi-seq callers that need to allocate
+    /// per-slot C++ samplers bound to this context. All usage sites must
+    /// document the unsafe access pattern.
+    ///
+    /// # Safety
+    /// The returned pointer is only valid while `self` is live. Do not
+    /// retain it across drops of `LlamaForward`.
+    pub unsafe fn ctx_raw(&self) -> *mut LlamaContext {
+        self.ctx
+    }
+
+    /// Raw model pointer — needed by multi-seq callers to allocate per-slot
+    /// samplers with `chimere_sampler_init(model, ...)`.
+    ///
+    /// # Safety
+    /// The returned pointer is only valid while `self` is live.
+    pub unsafe fn model_raw(&self) -> *const LlamaModel {
+        self.model as *const LlamaModel
+    }
+
+    /// Sample with a caller-provided per-slot sampler handle at a specific
+    /// batch index. Used by the multi-seq driver to invoke per-slot samplers
+    /// on the shared context.
+    ///
+    /// # Safety
+    /// `sampler` must be a valid pointer returned by
+    /// `chimere_sampler_init(...)` and bound to this model.
+    pub unsafe fn sample_slot(&self, sampler: *mut c_void, batch_idx: usize) -> u32 {
+        let tok = chimere_sampler_sample(sampler, self.ctx, batch_idx as c_int);
+        chimere_sampler_accept(sampler, self.ctx, tok);
+        tok as u32
     }
 
     /// Rollback position counter by n tokens.
