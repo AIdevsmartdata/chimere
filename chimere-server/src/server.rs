@@ -933,6 +933,12 @@ fn packed_to_logprob_content(packed: &[f32], tokenizer: &Tokenizer, max_top: usi
 /// Every field is owned so the struct can be moved across threads.
 struct InferenceArgs {
     prompt: String,
+    /// FINDING 5 (audit 2026-04-24): pre-tokenised prompt. When `Some`,
+    /// `run_streaming_inference_worker` skips re-encoding and reuses
+    /// the ids produced by `dispatch_streaming_inference` (which needs
+    /// the token count for scheduler metadata anyway). Eliminates a
+    /// duplicate tokenize pass on the streaming path.
+    prompt_tokens: Option<Vec<u32>>,
     max_tokens: usize,
     params: SamplingParams,
     enable_thinking: bool,
@@ -955,6 +961,7 @@ fn run_streaming_inference_worker(
 ) {
     let InferenceArgs {
         prompt,
+        prompt_tokens,
         max_tokens,
         params,
         enable_thinking,
@@ -962,12 +969,22 @@ fn run_streaming_inference_worker(
         top_logprobs_n,
     } = args;
 
-    // Encode prompt tokens.
-    let prompt_ids = match tokenizer.encode(prompt.as_str(), false) {
-        Ok(enc) => enc.get_ids().to_vec(),
-        Err(e) => {
-            let _ = tx.blocking_send(StreamMsg::Done(Some(format!("Tokenizer encode failed: {}", e))));
-            return;
+    // FINDING 5: use pre-tokenised ids if caller supplied them (streaming
+    // path via `dispatch_streaming_inference` already encoded once for
+    // the scheduler's metadata). Otherwise encode here — legacy callers
+    // that construct InferenceArgs with `prompt_tokens: None` still work.
+    let prompt_ids: Vec<u32> = if let Some(ids) = prompt_tokens {
+        ids
+    } else {
+        match tokenizer.encode(prompt.as_str(), false) {
+            Ok(enc) => enc.get_ids().to_vec(),
+            Err(e) => {
+                let _ = tx.blocking_send(StreamMsg::Done(Some(format!(
+                    "Tokenizer encode failed: {}",
+                    e
+                ))));
+                return;
+            }
         }
     };
 
@@ -1167,10 +1184,21 @@ async fn dispatch_streaming_inference(
 ) {
     // Clone what the closure captures before we decide which branch to take.
     let tokenizer = Arc::clone(&state.tokenizer);
-    let prompt_token_count = tokenizer
-        .encode(args.prompt.as_str(), false)
-        .map(|e| e.len())
-        .unwrap_or(0);
+
+    // FINDING 5 (audit 2026-04-24): tokenise the prompt ONCE here and
+    // thread the ids into InferenceArgs. The worker previously re-encoded
+    // the same string, costing ~1-3 ms per streaming request. If encoding
+    // fails we still hand an empty Vec downstream so the worker produces
+    // the same "zero tokens" error path it would have hit otherwise.
+    let prompt_ids_pre: Vec<u32> = match tokenizer.encode(args.prompt.as_str(), false) {
+        Ok(e) => e.get_ids().to_vec(),
+        Err(_) => Vec::new(),
+    };
+    let prompt_token_count = prompt_ids_pre.len();
+
+    let mut args = args;
+    args.prompt_tokens = Some(prompt_ids_pre);
+
     let max_tokens_u32 = args.max_tokens.min(u32::MAX as usize) as u32;
 
     match state.scheduler.as_ref() {
@@ -1280,6 +1308,9 @@ async fn chat_completions_stream(
         tx,
         InferenceArgs {
             prompt,
+            // dispatch_streaming_inference populates this from its own
+            // single-tokenize pass (FINDING 5). Caller passes None.
+            prompt_tokens: None,
             max_tokens,
             params,
             enable_thinking,

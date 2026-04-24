@@ -1462,7 +1462,11 @@ impl NativeDriver {
         };
 
         let n_entries = chunk_entries.len();
-        let out = self.llama.forward_multi_seq(&chunk_entries)?;
+        // FINDING 2 (audit 2026-04-24): use the no-copy borrow variant.
+        // The native sampler consumes logits via llama_get_logits_ith
+        // inside C++, so the 993 KB per-slot memcpy in the copying
+        // variant was being allocated → returned → dropped with no reader.
+        let out = self.llama.forward_multi_seq_borrow(&chunk_entries)?;
 
         // Update slot state.
         let slot = self.pool.get_mut(slot_id).unwrap();
@@ -1479,6 +1483,7 @@ impl NativeDriver {
         }
 
         // Last chunk — sample first gen token and transition.
+        // `out` now is `Vec<(seq_id, batch_idx)>` — same `.any(|(s, _)|)` shape.
         if !out.iter().any(|(s, _)| *s == slot.id as i32) {
             return Err(format!(
                 "tick_prefill_one: no logits returned for seq_id {}",
@@ -1560,7 +1565,11 @@ impl NativeDriver {
             })
             .collect();
 
-        let _out = self.llama.forward_multi_seq(&entries)?;
+        // FINDING 2 (audit 2026-04-24): no-copy variant. The sampler
+        // reads logits directly from libllama ctx via
+        // llama_get_logits_ith(batch_idx) so copying them Rust-side
+        // was ~993 KB × N slots of wasted memcpy per tick.
+        let _out = self.llama.forward_multi_seq_borrow(&entries)?;
 
         // Per-slot apply_bias → sample → emit. Batch index matches input order.
         for (batch_idx, &(slot_id, _tok, _pos)) in gen_inputs.iter().enumerate() {

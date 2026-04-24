@@ -1009,6 +1009,80 @@ impl LlamaForward {
         Ok(result)
     }
 
+    /// FINDING 2 (audit 2026-04-24): no-copy variant of
+    /// [`forward_multi_seq`]. Decodes the multi-seq batch identically but
+    /// returns only `(seq_id, batch_idx)` pairs instead of copying the
+    /// per-slot 993 KB (n_vocab=248320) logits buffer out of libllama's
+    /// internal tensor.
+    ///
+    /// The native scheduler only needs the presence check; actual logits
+    /// are read inside the C++ sampler via `llama_get_logits_ith` when
+    /// `sample_slot_with_logprobs(batch_idx)` runs. Keeping a borrowed
+    /// pointer alive between `forward_multi_seq_borrow` and the sampler
+    /// call is safe because:
+    ///   - `self` (owning the `ctx`) remains borrowed `&mut` for the
+    ///     entire scheduler tick, so no other FFI call can mutate the
+    ///     internal logits buffer mid-flight;
+    ///   - the sampler reads from the same `ctx` via `llama_get_logits_ith`
+    ///     which returns a pointer into the same buffer the non-copy
+    ///     variant would have dereferenced.
+    ///
+    /// `batch_idx` here is the index into the input `entries` slice (the
+    /// same value the copying variant would have used internally before
+    /// `to_vec()`).
+    ///
+    /// Legacy callers that need owned `Vec<f32>` logits should keep using
+    /// [`forward_multi_seq`]. This method is purely additive.
+    pub fn forward_multi_seq_borrow(
+        &mut self,
+        entries: &[MultiSeqEntry],
+    ) -> Result<Vec<(i32, usize)>, String> {
+        if entries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = entries.len() as i32;
+        let mut batch = unsafe { llama_batch_init(n, 0, 1) };
+
+        unsafe {
+            batch.n_tokens = n;
+            for (i, e) in entries.iter().enumerate() {
+                *batch.token.add(i) = e.token as i32;
+                *batch.pos.add(i) = e.pos;
+                *batch.n_seq_id.add(i) = 1;
+                let seq_ptr = *batch.seq_id.add(i);
+                *seq_ptr = e.seq_id;
+                *batch.logits.add(i) = if e.request_logits { 1 } else { 0 };
+            }
+        }
+
+        let ret = unsafe { llama_decode(self.ctx, batch) };
+        if ret != 0 {
+            unsafe { llama_batch_free(batch); }
+            return Err(format!("llama_decode multi_seq_borrow failed: code {}", ret));
+        }
+
+        // Presence check: each requested entry must have non-null logits.
+        // We do NOT copy the 248 K-float buffer — the sampler reads it
+        // directly from libllama's internal ctx tensor via
+        // llama_get_logits_ith(batch_idx).
+        let mut result: Vec<(i32, usize)> = Vec::with_capacity(entries.len());
+        for (i, e) in entries.iter().enumerate() {
+            if !e.request_logits { continue; }
+            let logits_ptr = unsafe { llama_get_logits_ith(self.ctx, i as i32) };
+            if logits_ptr.is_null() {
+                unsafe { llama_batch_free(batch); }
+                return Err(format!(
+                    "null logits at batch idx {} seq_id {}",
+                    i, e.seq_id,
+                ));
+            }
+            result.push((e.seq_id, i));
+        }
+
+        unsafe { llama_batch_free(batch); }
+        Ok(result)
+    }
+
     /// Release all KV cache pages (and SSM state, if recurrent) owned by
     /// `seq_id`. Call when a slot finishes or the client disconnects.
     ///

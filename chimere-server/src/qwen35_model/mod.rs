@@ -1350,21 +1350,31 @@ impl Qwen35Model {
                     state.position = llama.pos() as usize;
 
                     // Pack into [token_id, n_top, t0, lp0, t1, lp1, t2, lp2, t3, lp3, t4, lp4]
-                    let mut packed = vec![sampled as f32, logprobs.len() as f32];
-                    for lp in &logprobs {
-                        packed.push(lp.token as f32);
-                        packed.push(lp.logprob);
+                    // FINDING 1 (audit 2026-04-24): avoid packed.clone() by
+                    // building the tensor from a small stack array, then
+                    // moving the owned Vec into the RefCell. Net allocs
+                    // unchanged, but the redundant Vec-to-Vec memcpy is gone.
+                    let mut packed_arr: [f32; 12] = [0.0; 12];
+                    packed_arr[0] = sampled as f32;
+                    packed_arr[1] = logprobs.len() as f32;
+                    for (i, lp) in logprobs.iter().enumerate().take(5) {
+                        packed_arr[2 + i * 2]     = lp.token as f32;
+                        packed_arr[2 + i * 2 + 1] = lp.logprob;
                     }
-                    while packed.len() < 12 { packed.push(0.0); }
 
-                    // Store packed logprobs for SSE streaming to read.
-                    *self.last_packed_logprobs.borrow_mut() = Some(packed.clone());
-
-                    let logits_tensor = Tensor::from_vec(
-                        packed,
+                    // Build tensor first — Tensor::from_slice copies from
+                    // the stack array into its own internal storage.
+                    let logits_tensor = Tensor::from_slice(
+                        &packed_arr[..],
                         (1, 12),
                         &Device::Cpu,
                     )?;
+
+                    // Store owned Vec for SSE streaming to read. One fresh
+                    // allocation, no cloning of an already-owned buffer.
+                    *self.last_packed_logprobs.borrow_mut() =
+                        Some(packed_arr.to_vec());
+
                     return Ok((logits_tensor, None));
                 }
 
