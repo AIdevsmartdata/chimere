@@ -65,11 +65,16 @@ fn main() {
 
     println!("cargo:rerun-if-changed=chimere_sampler.cpp");
 
-    // Link libcommon.a from ik_llama for common_sampler_*
-    let common_lib_dir = env::var("GGML_COMMON_LIB_DIR")
-        .unwrap_or_else(|_| "{IKLLAMACPP_DIR}/build_sm120/common".to_string());
-    println!("cargo:rustc-link-search=native={}", common_lib_dir);
-    println!("cargo:rustc-link-lib=static=common");
+    // NOTE (2026-04-24): chimere_sampler.cpp is now self-contained — it no
+    // longer calls `common_sampler_*`. We therefore do NOT link libcommon.a.
+    // libcommon's ABI drifted with the autoparser refactor, and its
+    // `common_sampler_init` crashes with an uncaught foreign exception on
+    // fresh chimere-server builds. The inline sampler chain in
+    // chimere_sampler.cpp only depends on libllama.so's public C API.
+    //
+    // If you need to re-introduce a libcommon dependency (e.g. to use
+    // `common_tokenize` or `common_token_to_piece`), re-add the link here,
+    // but keep chimere_sampler_init self-contained.
 
     // -----------------------------------------------------------------------
     // Part 2: Compile ggml_cuda_gemv.cu (GPU MMVQ wrapper)
