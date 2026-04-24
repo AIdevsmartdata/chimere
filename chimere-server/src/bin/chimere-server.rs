@@ -28,6 +28,10 @@
 //! | `CHIMERE_KV_TYPE_K`| `8`                                                                    | KV cache key type (8=Q8_0) |
 //! | `CHIMERE_KV_TYPE_V`| `2`                                                                    | KV cache value type (2=Q4_0) |
 //! | `CHIMERE_FLASH_ATTN`| `1`                                                                   | Enable flash attention (default: on) |
+//! | `CHIMERE_MULTISLOT`| `1`                                                                    | Number of scheduler slots (>=2 arms J2) |
+//! | `CHIMERE_MULTISLOT_NATIVE` | (unset)                                                        | Set to `1` with `CHIMERE_MULTISLOT>=2` to arm the J4-rewrite NativeScheduler |
+//! | `CHIMERE_NATIVE_ENGRAM_ALPHA` | `0.0`                                                       | Default engram bias alpha used by NativeScheduler when request does not override |
+//! | `CHIMERE_SKIP_LEGACY_LLAMA` | (unset)                                                       | Set to `1` to skip the legacy `Qwen35Model::init_llama_forward` when NativeScheduler is armed (saves ~KV cache VRAM) |
 
 use std::sync::Arc;
 
@@ -38,7 +42,7 @@ use chimere_deltanet::generic_model::GenericModel;
 use chimere_deltanet::gguf_loader::GgufFile;
 use chimere_deltanet::qwen35_model::Qwen35Model;
 use chimere_deltanet::server::{AppState, AppStateModel, build_router};
-use chimere_deltanet::slot_scheduler::{Scheduler, SchedulerConfig};
+use chimere_deltanet::slot_scheduler::{NativeScheduler, Scheduler, SchedulerConfig};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
@@ -172,6 +176,39 @@ async fn main() {
     }
 
     // -----------------------------------------------------------------
+    // M1 J4-final: decide up-front whether the NativeScheduler will be
+    // armed. This needs to happen BEFORE the model loader because a
+    // second `LlamaForward` FFI context is built for the scheduler, and
+    // the legacy `Qwen35Model::init_llama_forward` must be skipped when
+    // the operator opts in to `CHIMERE_SKIP_LEGACY_LLAMA=1` (avoids
+    // doubling KV cache VRAM).
+    //
+    // Default behaviour when `CHIMERE_MULTISLOT_NATIVE` is unset or `0`:
+    //   - scheduler_cfg.is_native() == false
+    //   - legacy Qwen35Model::init_llama_forward is called as before
+    //   - `native_scheduler_arc` stays `None`
+    //   - BIT-IDENTICAL to current prod.
+    // -----------------------------------------------------------------
+    let scheduler_cfg_preview = SchedulerConfig::from_env();
+    let native_planned = scheduler_cfg_preview.is_native();
+    let skip_legacy_llama = native_planned
+        && std::env::var("CHIMERE_SKIP_LEGACY_LLAMA")
+            .map(|v| {
+                let t = v.trim();
+                !(t.is_empty() || t == "0" || t.eq_ignore_ascii_case("false"))
+            })
+            .unwrap_or(false);
+    if native_planned {
+        eprintln!(
+            "[chimere-server] M1 J4-final: NativeScheduler WILL be armed \
+             (num_slots={}, queue_cap={}). skip_legacy_llama={}",
+            scheduler_cfg_preview.num_slots,
+            scheduler_cfg_preview.queue_cap,
+            skip_legacy_llama,
+        );
+    }
+
+    // -----------------------------------------------------------------
     // Load model according to arch.
     //
     // Qwen3.5 — three paths ordered by performance:
@@ -194,11 +231,26 @@ async fn main() {
                         std::process::exit(1);
                     }
                 };
-                if let Err(e) = shell.init_llama_forward() {
-                    eprintln!("[chimere-server] Fatal: llama_backend init failed: {}", e);
-                    std::process::exit(1);
+                if skip_legacy_llama {
+                    // J4-final: NativeScheduler armed + operator opted in.
+                    // Skip the per-model libllama context — the scheduler
+                    // below will build its own via `llama_backend::from_env`.
+                    // The legacy `Mutex<AppStateModel>` path will refuse
+                    // Qwen35 requests (it expects `llama_forward` to be
+                    // initialised). The native SSE path does not touch it.
+                    eprintln!(
+                        "[chimere-server] CHIMERE_SKIP_LEGACY_LLAMA=1 → \
+                         skipping Qwen35Model::init_llama_forward. Non-streaming \
+                         requests WILL be rejected by the legacy path. Only \
+                         `stream=true` requests are supported in this mode."
+                    );
+                } else {
+                    if let Err(e) = shell.init_llama_forward() {
+                        eprintln!("[chimere-server] Fatal: llama_backend init failed: {}", e);
+                        std::process::exit(1);
+                    }
+                    eprintln!("[chimere-server] libllama backend ready.");
                 }
-                eprintln!("[chimere-server] libllama backend ready.");
                 shell
             } else if cudarc_forward {
                 eprintln!("[chimere-server] CUDARC mode: loading lightweight shell (no Candle weights)...");
@@ -315,7 +367,7 @@ async fn main() {
             "[chimere-server] M1 multi-slot ENABLED: num_slots={}, queue_cap={} (CHIMERE_MULTISLOT)",
             scheduler_cfg.num_slots, scheduler_cfg.queue_cap,
         );
-        let mut sched = Scheduler::new(scheduler_cfg);
+        let mut sched = Scheduler::new(scheduler_cfg.clone());
         let handles = sched.spawn_workers();
         let sched_arc = Arc::new(sched);
         // Detach the dispatcher JoinHandle — it lives for the process.
@@ -331,6 +383,123 @@ async fn main() {
         None
     };
 
+    // ---------------------------------------------------------------------
+    // M1 J4-final: NativeScheduler construction.
+    //
+    // Only built when `scheduler_cfg.is_native()` — i.e. both
+    // `CHIMERE_MULTISLOT>=2` AND `CHIMERE_MULTISLOT_NATIVE=1`. We build a
+    // SEPARATE `LlamaForward` via `llama_backend::from_env()` (which reads
+    // `CHIMERE_MULTISLOT` and automatically sets `n_seq_max` to the slot
+    // count — see `llama_backend.rs::from_env`). This forward context is
+    // owned by the scheduler driver thread for the process lifetime.
+    //
+    // The engram lookup is loaded from `CHIMERE_ENGRAM_DIR` /
+    // `CHIMERE_ENGRAM_FILE` and shared with the native slot pool. When
+    // `MultiEngramLookup::from_env()` returns `None`, slots fall back to
+    // pure sampler behaviour (engram_alpha ignored).
+    //
+    // When NOT armed, `native_scheduler_arc = None` and the handlers route
+    // every request through the legacy `Mutex<AppStateModel>` path.
+    // BIT-IDENTICAL to prod today.
+    // ---------------------------------------------------------------------
+    let native_scheduler_arc: Option<Arc<NativeScheduler>> = if scheduler_cfg.is_native() {
+        eprintln!(
+            "[chimere-server] M1 J4-final: building NativeScheduler \
+             (num_slots={}, queue_cap={}, CHIMERE_MULTISLOT_NATIVE=1)...",
+            scheduler_cfg.num_slots, scheduler_cfg.queue_cap,
+        );
+
+        // 1. Build the dedicated LlamaForward for the scheduler.
+        //    `from_env()` reads CHIMERE_MULTISLOT and sets n_seq_max>=num_slots
+        //    when CHIMERE_MULTISLOT_NATIVE=1 (already patched — see
+        //    `llama_backend.rs::from_env` lines 1795-1813).
+        let llama_fwd = match chimere_deltanet::llama_backend::from_env() {
+            Ok(f) => {
+                eprintln!(
+                    "[chimere-server] NativeScheduler: LlamaForward context built \
+                     (vocab={})",
+                    f.n_vocab(),
+                );
+                f
+            }
+            Err(e) => {
+                eprintln!(
+                    "[chimere-server] Fatal: NativeScheduler LlamaForward \
+                     construction failed: {}",
+                    e,
+                );
+                std::process::exit(1);
+            }
+        };
+
+        // 2. Load the engram lookup (optional). Shared with all slots.
+        let engram_global = chimere_deltanet::engram_lookup::MultiEngramLookup::from_env()
+            .map(Arc::new);
+        if let Some(eg) = &engram_global {
+            eprintln!(
+                "[chimere-server] NativeScheduler: engram_global attached ({} tables)",
+                eg.len(),
+            );
+        } else {
+            eprintln!(
+                "[chimere-server] NativeScheduler: no engram tables loaded \
+                 (CHIMERE_ENGRAM_DIR / CHIMERE_ENGRAM_FILE unset or empty)"
+            );
+        }
+
+        // 3. Default engram alpha (overridable per-request).
+        let default_engram_alpha: f32 = std::env::var("CHIMERE_NATIVE_ENGRAM_ALPHA")
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0.0);
+
+        // 4. Construct the scheduler and spawn its driver.
+        let mut native_sched = match NativeScheduler::new(
+            scheduler_cfg.clone(),
+            engram_global,
+            default_engram_alpha,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!(
+                    "[chimere-server] Fatal: NativeScheduler::new failed: {}",
+                    e,
+                );
+                std::process::exit(1);
+            }
+        };
+
+        // Spawn the driver BEFORE wrapping in Arc — spawn_native_driver
+        // requires `&mut self` to consume the admission_rx end.
+        let driver_handle = match native_sched.spawn_native_driver(llama_fwd) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!(
+                    "[chimere-server] Fatal: NativeScheduler driver spawn failed: {}",
+                    e,
+                );
+                std::process::exit(1);
+            }
+        };
+        // Driver thread is process-lifetime — detach the JoinHandle.
+        std::mem::forget(driver_handle);
+
+        let sched_arc = Arc::new(native_sched);
+        eprintln!(
+            "[chimere-server] NativeScheduler ACTIVE: num_slots={}",
+            scheduler_cfg.num_slots,
+        );
+        Some(sched_arc)
+    } else {
+        if scheduler_cfg.is_active() {
+            eprintln!(
+                "[chimere-server] M1 J4 NativeScheduler disabled \
+                 (CHIMERE_MULTISLOT_NATIVE unset or =0). Using J2 closure path."
+            );
+        }
+        None
+    };
+
     let state = Arc::new(AppState {
         model: Mutex::new(app_model),
         tokenizer,
@@ -339,10 +508,10 @@ async fn main() {
         user_agent_map: Mutex::new(std::collections::HashMap::new()),
         max_agents,
         scheduler: scheduler_arc,
-        // M1 J4-rewrite: NativeScheduler is opt-in via CHIMERE_MULTISLOT_NATIVE=1.
+        // M1 J4-final: NativeScheduler is opt-in via CHIMERE_MULTISLOT_NATIVE=1.
         // When disabled (prod default), stays None and all requests take the
         // legacy `Mutex<AppStateModel>` path.
-        native_scheduler: None,
+        native_scheduler: native_scheduler_arc,
     });
 
     let app = build_router(state);
