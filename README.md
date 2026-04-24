@@ -79,7 +79,20 @@ open upstream PR ([ikawrakow/ik_llama.cpp#1593](https://github.com/ikawrakow/ik_
 
 ## Quick start
 
-### Build
+### One-shot install (Linux, NVIDIA)
+
+```sh
+git clone https://github.com/AIdevsmartdata/chimere.git
+cd chimere
+./install-chimere.sh                   # auto-detects SM (sm_120 / sm_89 / sm_86)
+./install-chimere.sh --with-model      # also pulls Chimere v3 RAMP GGUF (~15.2 GB)
+```
+
+`install-chimere.sh` checks prerequisites (`cmake`, `rustc`, `nvcc`), clones and
+builds the `ik_llama.cpp` fork, then builds `chimere-server` in release mode.
+It never runs `sudo` — missing packages are reported, not installed.
+
+### Manual build
 
 ```sh
 # Backend (one-time)
