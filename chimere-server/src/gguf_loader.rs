@@ -117,6 +117,8 @@ pub enum GgmlType {
     F64 = 28,
     Iq1M = 29,
     Bf16 = 30,
+    Tq3_1s = 44,
+    Tq3_4s = 46,
 }
 
 impl GgmlType {
@@ -151,6 +153,8 @@ impl GgmlType {
             28 => Some(Self::F64),
             29 => Some(Self::Iq1M),
             30 => Some(Self::Bf16),
+            44 => Some(Self::Tq3_1s),
+            46 => Some(Self::Tq3_4s),
             _ => None,
         }
     }
@@ -189,6 +193,8 @@ impl GgmlType {
             Self::F64 => (1, 8),
             Self::Iq1M => (256, 56),
             Self::Bf16 => (1, 2),
+            Self::Tq3_1s => (32, 16),  // 2*fp16 + 12 bytes 3-bit packed
+            Self::Tq3_4s => (32, 16),  // 4 u8 E3M5 scales + 12 bytes 3-bit packed
         }
     }
 
