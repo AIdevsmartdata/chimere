@@ -39,6 +39,14 @@ path = "src/bin/bench_mtp.rs"
 name = "test-nemotron"
 path = "src/bin/test-nemotron.rs"
 
+# M1 J2 smoke test — no model, no FFI, no VRAM.
+# Exercises the slot_scheduler admission → dispatcher → closure path with
+# fake inference workers (thread::sleep + string messages).
+[[bin]]
+name = "j2-smoke"
+path = "src/bin/j2_smoke.rs"
+required-features = ["server"]
+
 [profile.release]
 opt-level = 3
 lto = "fat"
