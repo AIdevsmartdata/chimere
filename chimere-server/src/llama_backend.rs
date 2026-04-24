@@ -1792,7 +1792,27 @@ pub fn from_env() -> Result<LlamaForward, String> {
         .map(|v| v != "0")
         .unwrap_or(true);
 
-    LlamaForward::new(
+    // M1 J4-rewrite: when the NativeScheduler is armed (`CHIMERE_MULTISLOT>=2`
+    // AND `CHIMERE_MULTISLOT_NATIVE=1`), the context must allocate per-slot
+    // KV pages / SSM states. Read the slot count here and pass via
+    // `new_multi_seq`. Legacy path (MULTISLOT_NATIVE unset) keeps n_seq_max=1
+    // for bit-identical production behaviour.
+    let native_active = std::env::var("CHIMERE_MULTISLOT_NATIVE")
+        .ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(0) >= 1;
+    let n_seq_max: u32 = if native_active {
+        std::env::var("CHIMERE_MULTISLOT")
+            .ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1).max(1).min(8)
+    } else {
+        1
+    };
+    if n_seq_max > 1 {
+        eprintln!(
+            "[llama_backend] NativeScheduler active: allocating ctx with n_seq_max={}",
+            n_seq_max,
+        );
+    }
+
+    LlamaForward::new_multi_seq(
         &model_path,
         99, // -ngl 99 = offload all layers
         n_ctx,
@@ -1800,5 +1820,6 @@ pub fn from_env() -> Result<LlamaForward, String> {
         Some(type_k),
         Some(type_v),
         flash_attn,
+        n_seq_max,
     )
 }
