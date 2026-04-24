@@ -223,6 +223,9 @@ pub struct Slot {
     /// Set by the HTTP handler if the client drops the connection.
     /// `step()` checks this at the top of each iteration.
     pub cancelled: Arc<AtomicBool>,
+    /// J6 — reason captured when `mark_draining()` is called. Consumed by
+    /// the dispatcher when it sends the terminal `StreamMsg::Done`.
+    pub finish_reason: Option<String>,
 }
 
 impl Slot {
@@ -245,6 +248,7 @@ impl Slot {
             request_id: String::new(),
             stats: SlotStats::default(),
             cancelled: Arc::new(AtomicBool::new(false)),
+            finish_reason: None,
         }
     }
 
@@ -270,11 +274,61 @@ impl Slot {
         self.request_id.clear();
         self.stats = SlotStats::default();
         self.cancelled.store(false, Ordering::SeqCst);
+        self.finish_reason = None;
         // J5a: reset per-slot sampler state between conversations.
         if let Some(s) = self.sampler.as_ref() {
             s.reset();
             s.clear_engram_bias();
         }
+    }
+
+    // ------------------------------------------------------------------
+    // J6 — rollout safety: stop tokens terminate generation
+    // ------------------------------------------------------------------
+
+    /// Transition into the terminal `Draining` state. The dispatcher is
+    /// expected to observe this on the next scheduler tick, emit the final
+    /// `StreamMsg::Done { finish_reason }` frame, then call `mark_free`.
+    ///
+    /// Idempotent: calling `mark_draining` on an already-draining slot
+    /// only updates `finish_reason` if one was not set yet.
+    ///
+    /// `reason` conventions (kept aligned with OpenAI's chat API):
+    /// - `"stop"`   → stop token hit, natural end.
+    /// - `"length"` → `max_tokens` / budget exhausted.
+    /// - `"cancel"` → client disconnected or aborted.
+    /// - `"error"` → internal failure; caller should also send an Error frame.
+    pub fn mark_draining(&mut self, reason: &str) {
+        self.state = SlotState::Draining;
+        if self.finish_reason.is_none() {
+            self.finish_reason = Some(reason.to_string());
+        }
+    }
+
+    /// `true` once `mark_draining` has fired. Dispatcher uses this to avoid
+    /// sampling further tokens on dead slots (saves one llama_decode step
+    /// between the disconnect and the slot being reclaimed).
+    pub fn is_draining(&self) -> bool {
+        matches!(self.state, SlotState::Draining)
+    }
+
+    /// Called right after a token has been sampled by the scheduler's
+    /// per-step logic. Returns `true` if generation should continue on
+    /// this slot, `false` if the slot must stop (stop-token hit).
+    ///
+    /// When this returns `false`, the caller MUST:
+    ///   1. call `mark_draining("stop")` on this slot, and
+    ///   2. emit the sampled token AS-IS to the stream, then
+    ///   3. emit the terminal `StreamMsg::Done` frame.
+    ///
+    /// J6c extends this with a `</think>` toggle that flips `thinking`
+    /// off before evaluating stop tokens; J6d adds disconnect detection.
+    pub fn on_token_sampled(&mut self, tok: u32) -> bool {
+        // Per-request stop tokens defined on SamplingParams.
+        if self.params.stop_tokens.contains(&tok) {
+            return false;
+        }
+        true
     }
 
     // ------------------------------------------------------------------
