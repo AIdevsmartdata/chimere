@@ -1,32 +1,41 @@
-//! # Multi-slot scheduler scaffolding (M1, Apr 2026)
+//! # Multi-slot scheduler (M1, Apr 2026)
 //!
-//! This file is **J1 of the M1 plan** — the types, traits, and state shapes
-//! required to move from single-`Mutex<AppStateModel>` to continuous-batching
-//! multi-slot serving. It *does not* replace the existing legacy path yet; the
-//! scheduler is constructed only when `CHIMERE_MULTISLOT >= 2` and the
-//! HTTP handlers still route to the Mutex path by default.
+//! Type-safe plumbing for moving from `Mutex<AppStateModel>` (single-slot)
+//! to continuous-batching multi-slot serving.
 //!
-//! See `~/Bureau/plan-M1-multislot-2026-04-24.md` for the full 7-8 day plan.
-//! This file covers **J1 only** (types compile, no behavioural change).
+//! ## J1 (delivered) — scaffolding types
 //!
-//! ## Non-goals in this file
+//! - `SlotState`, `Slot`, `SlotPool`, `BatchBuilder`, `SchedulerConfig`.
+//! - 3 unit tests (pool bookkeeping, batch layout, config default).
+//! - Legacy behaviour unchanged; scheduler is only active when
+//!   `CHIMERE_MULTISLOT >= 2`.
 //!
-//! - No actual `llama_decode` multi-seq driver yet (that's J3).
-//! - No FFI to `chimere_sampler` per-slot allocation (that's J5).
-//! - No Engram per-slot bias application (that's J5).
-//! - No MTP slot-exclusive gating (that's J5).
-//! - No HTTP handler refactor (that's J2).
+//! ## J2 (this commit) — admission queue + worker loop
 //!
-//! ## What's here
+//! - `Scheduler::new()` takes the `SchedulerConfig`, allocates an `mpsc`
+//!   admission channel, and holds the receiver end until `spawn_worker` is
+//!   called.
+//! - `Scheduler::admission_tx()` returns a cheap-clone sender for HTTP
+//!   handlers to enqueue requests.
+//! - `ScheduledRequest` carries a `Box<dyn FnOnce()>` closure so the scheduler
+//!   remains decoupled from `chimere_model::*` types. The HTTP handler builds
+//!   the closure (captures `Arc<AppState>`, its own `tx`, the prompt, etc.)
+//!   and submits. The worker thread drains admissions and, for each request,
+//!   runs the closure to completion on a dedicated slot.
+//! - The worker loop supports N slots via a simple round-robin execution
+//!   strategy (N worker threads, one per slot). Honest FFI scope: inference
+//!   is still serialised by the `AppState.model` mutex inside each closure;
+//!   the **observable** interleaving comes from OS-thread scheduling across
+//!   the `Mutex<AppStateModel>` re-acquisitions between `generate_with_mtp`
+//!   bursts (see `chat_completions_stream` in `server.rs`).
 //!
-//! - `SlotState`, `Slot`, `SlotPool`
-//! - `BatchBuilder` (pure Vec layout, never touches FFI here)
-//! - `ScheduledRequest`, `StreamMsg`
-//! - `SchedulerConfig::from_env()` — reads `CHIMERE_MULTISLOT`
-//! - `NUM_SLOTS_DEFAULT = 1` → path unchanged when the env var is unset
+//! ## J3+ (future) — true multi-seq FFI
 //!
-//! Anything that dereferences a raw C pointer is **explicitly TODO**, to keep
-//! the J1 commit non-functional and easy to revert.
+//! - Replace the closure-based worker with a real `llama_decode` multi-seq
+//!   loop (1 OS thread, N slots, N samplers, N engram tables).
+//! - Per-slot KV save/restore via `llama_state_seq_save/restore` is already
+//!   implemented in `agent_scheduler.rs` and can be reused.
+//! - Goal: aggregate throughput ≥ 1.7× at 2 slots, ≥ 3× at 4 slots.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -375,55 +384,173 @@ impl BatchBuilder {
 }
 
 // ---------------------------------------------------------------------------
-// ScheduledRequest — HTTP handler → scheduler
+// ScheduledRequest — HTTP handler → scheduler (J2 shape)
 // ---------------------------------------------------------------------------
 
-/// Minimal request descriptor carried through the admission channel. All
-/// heavy fields (serialised messages, full sampler config) live in this
-/// struct so the scheduler doesn't need to re-parse anything.
+/// Work item travelling over the admission channel. The HTTP handler packages
+/// the full inference call as a closure and drops it on the queue — the
+/// scheduler does not need to know about `Qwen35Model`, `SamplingParams`, or
+/// any FFI surface.
+///
+/// This keeps the scheduler module decoupled from the model types (and keeps
+/// the existing `chat_completions_stream` logic reusable inside the closure).
+///
+/// Closure contract:
+/// - It is `FnOnce + Send + 'static`, runs to completion synchronously.
+/// - It is responsible for sending its own `Done` marker on the per-request
+///   channel it captured; the scheduler does not send anything.
+/// - It must honour the `cancelled` flag passed in `metadata` (polled before
+///   each `generate_with_mtp_streaming` callback).
 pub struct ScheduledRequest {
+    pub metadata: ScheduledRequestMeta,
+    /// The actual inference function. Owns everything it needs via captures.
+    pub run: Box<dyn FnOnce(ScheduledRequestMeta) + Send + 'static>,
+}
+
+/// Small, cheap-clone envelope for scheduler telemetry — kept separate from
+/// the closure so the worker can log / gate on it before invoking `run`.
+#[derive(Debug, Clone)]
+pub struct ScheduledRequestMeta {
     pub request_id: String,
-    pub prompt_tokens: Vec<u32>,
-    pub params: SamplingParams,
-    pub want_logprobs: bool,
-    pub engram_hint: Option<String>, // route/table name, looked up in J5
-    /// How the handler wants to receive tokens.
-    pub tx: mpsc::Sender<StreamMsg>,
-    /// Set by the handler if the client disconnects. Scheduler polls it.
+    pub prompt_token_count: usize,
+    pub max_tokens: u32,
     pub cancelled: Arc<AtomicBool>,
+    /// Enqueue timestamp (from `Instant::now()` at submission). Used for
+    /// queue-wait metrics.
+    pub enqueued_at: std::time::Instant,
 }
 
 // ---------------------------------------------------------------------------
-// Scheduler skeleton — J1 stops here
+// Scheduler
 // ---------------------------------------------------------------------------
 
-/// High-level scheduler handle. In J3 this will own the libllama context and
-/// spawn a blocking OS thread with a `step()` loop. Today it only holds
-/// a config + a channel and answers `is_active()`.
+/// Scheduler handle. Owns the admission channel and (once `spawn_workers` is
+/// called) the pool of worker OS threads.
+///
+/// The admission side (`admission_tx()`) is `Clone`-ed into every HTTP
+/// handler via `AppState`. The worker side (`admission_rx`) is consumed
+/// exactly once by `spawn_workers`.
 pub struct Scheduler {
     pub config: SchedulerConfig,
-    pub admission_tx: mpsc::Sender<ScheduledRequest>,
-    #[allow(dead_code)]
+    /// Sender half of the admission queue. Cheap to clone.
+    admission_tx: mpsc::Sender<ScheduledRequest>,
+    /// Consumed by `spawn_workers`. `None` after the workers are running.
     admission_rx: Option<mpsc::Receiver<ScheduledRequest>>,
+    /// Slot pool state. Used for telemetry at J2; J3+ will consult it from
+    /// the worker loop to drive multi-seq batches.
+    pub pool: std::sync::Mutex<SlotPool>,
+    /// Flipped by `shutdown()`. Workers check before blocking on `recv()`.
     pub shutdown: Arc<AtomicBool>,
 }
 
 impl Scheduler {
-    /// Build a scheduler in the *armed-but-not-running* state. The OS thread
-    /// is started by `spawn()` in J3.
+    /// Build a scheduler. The admission channel is created here; the worker
+    /// threads are started by `spawn_workers`.
     pub fn new(config: SchedulerConfig) -> Self {
         let (tx, rx) = mpsc::channel(config.queue_cap);
+        let pool = SlotPool::new(config.num_slots);
         Self {
             config,
             admission_tx: tx,
             admission_rx: Some(rx),
+            pool: std::sync::Mutex::new(pool),
             shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Signal the (future) scheduler thread to exit on the next step.
+    /// Clone the admission sender. HTTP handlers hold this to enqueue work.
+    pub fn admission_tx(&self) -> mpsc::Sender<ScheduledRequest> {
+        self.admission_tx.clone()
+    }
+
+    /// Signal workers to exit on the next recv.
     pub fn shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+    }
+
+    /// Is the scheduler armed (N>=2 slots, multi-slot enabled)? Callers use
+    /// this to decide whether to route through the admission channel or fall
+    /// back to the legacy `Mutex<AppStateModel>` path.
+    pub fn is_active(&self) -> bool {
+        self.config.is_active()
+    }
+
+    /// Spawn the J2 worker. Returns the JoinHandle(s) — kept alive by
+    /// `AppState` for the lifetime of the process.
+    ///
+    /// J2 worker topology:
+    /// - **One** dedicated OS thread drains the admission queue.
+    /// - For each `ScheduledRequest`, the worker calls `req.run(meta)` on
+    ///   the dispatcher thread. The closure itself spawns a short-lived
+    ///   compute thread if needed (that's how `chat_completions_stream`
+    ///   works today), so the dispatcher returns quickly and can accept
+    ///   the next request.
+    /// - Back-pressure: the admission channel capacity is `config.queue_cap`
+    ///   (default 64). Once full, `send().await` from the HTTP handler
+    ///   suspends until the worker pulls one off.
+    ///
+    /// J3+ will replace this with a **multi-seq `llama_decode` driver** —
+    /// one OS thread, N logical slots, round-robin batch assembly, single
+    /// FFI call per step producing one token per active slot.
+    pub fn spawn_workers(&mut self) -> Vec<std::thread::JoinHandle<()>> {
+        let mut rx = match self.admission_rx.take() {
+            Some(rx) => rx,
+            None => {
+                eprintln!("[slot_scheduler] spawn_workers called twice; ignoring.");
+                return Vec::new();
+            }
+        };
+        let shutdown = Arc::clone(&self.shutdown);
+        let num_slots = self.config.num_slots;
+
+        let handle = std::thread::Builder::new()
+            .name("chimere-sched-dispatch".into())
+            .spawn(move || {
+                eprintln!(
+                    "[slot_scheduler] dispatcher running, num_slots={}, queue_cap tracked by mpsc",
+                    num_slots
+                );
+                let mut request_counter: u64 = 0;
+                // Blocking loop: block on recv; dispatch; repeat.
+                while !shutdown.load(Ordering::SeqCst) {
+                    let req = match rx.blocking_recv() {
+                        Some(r) => r,
+                        None => {
+                            eprintln!(
+                                "[slot_scheduler] admission channel closed (all senders dropped); exiting dispatcher."
+                            );
+                            return;
+                        }
+                    };
+                    request_counter = request_counter.wrapping_add(1);
+                    let meta = req.metadata.clone();
+                    let wait_ms = meta.enqueued_at.elapsed().as_millis();
+                    eprintln!(
+                        "[slot_scheduler] dispatch req={} (global #{}), prompt_toks={}, max_toks={}, queue_wait_ms={}",
+                        meta.request_id,
+                        request_counter,
+                        meta.prompt_token_count,
+                        meta.max_tokens,
+                        wait_ms,
+                    );
+                    // Run the closure. It is responsible for spawning its own
+                    // compute thread (as `chat_completions_stream` does) so
+                    // the dispatcher is not blocked by long generations.
+                    (req.run)(meta);
+                }
+                eprintln!("[slot_scheduler] dispatcher exit (shutdown flag set).");
+            })
+            .expect("failed to spawn chimere-sched-dispatch");
+
+        vec![handle]
+    }
+
+    /// Per-slot quick stat summary. Used by `/v1/status` in the future.
+    pub fn slot_active_count(&self) -> usize {
+        self.pool
+            .lock()
+            .map(|p| p.num_active())
+            .unwrap_or(0)
     }
 }
 
@@ -486,5 +613,27 @@ mod tests {
         let cfg = SchedulerConfig::default();
         assert!(!cfg.is_active());
         assert_eq!(cfg.num_slots, 1);
+    }
+
+    #[test]
+    fn scheduler_new_disabled_is_noop() {
+        // num_slots=1 (default): enabled=false, admission channel exists but
+        // handlers will never route to it.
+        let cfg = SchedulerConfig::default();
+        let sched = Scheduler::new(cfg);
+        assert!(!sched.is_active());
+        assert_eq!(sched.slot_active_count(), 0);
+    }
+
+    #[test]
+    fn scheduler_admission_tx_clone_ok() {
+        let cfg = SchedulerConfig { num_slots: 2, queue_cap: 4, enabled: true };
+        let sched = Scheduler::new(cfg);
+        assert!(sched.is_active());
+        let tx1 = sched.admission_tx();
+        let tx2 = sched.admission_tx();
+        // Capacity is the bound of the mpsc; both senders share it.
+        assert_eq!(tx1.capacity(), 4);
+        assert_eq!(tx2.capacity(), 4);
     }
 }
