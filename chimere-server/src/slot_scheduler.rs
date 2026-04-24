@@ -1081,4 +1081,166 @@ mod tests {
         assert_eq!(tx1.capacity(), 4);
         assert_eq!(tx2.capacity(), 4);
     }
+
+    // ----------------------------------------------------------------
+    // J6 — rollout safety state machine tests
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn j6_stop_tokens_empty_never_stops() {
+        let mut s = Slot::new(0);
+        s.state = SlotState::Generating;
+        assert!(s.params.stop_tokens.is_empty());
+        for tok in [0u32, 1, 42, 248069, 1_000_000] {
+            assert!(s.on_token_sampled(tok), "empty stop list must never terminate on tok={}", tok);
+        }
+        assert!(!s.is_draining());
+    }
+
+    #[test]
+    fn j6_stop_tokens_terminate() {
+        let mut s = Slot::new(0);
+        s.state = SlotState::Generating;
+        s.params.stop_tokens = vec![99, 100];
+        assert!(s.on_token_sampled(1));
+        assert!(s.on_token_sampled(2));
+        assert!(!s.on_token_sampled(99));
+        s.mark_draining("stop");
+        assert!(s.is_draining());
+        assert_eq!(s.finish_reason.as_deref(), Some("stop"));
+        // mark_draining idempotent on finish_reason.
+        s.mark_draining("length");
+        assert_eq!(s.finish_reason.as_deref(), Some("stop"));
+    }
+
+    #[test]
+    fn j6_thinking_flag_flips_on_close() {
+        let mut s = Slot::new(0);
+        s.state = SlotState::Generating;
+        s.thinking = true;
+        assert!(s.on_token_sampled(123));
+        assert!(s.thinking);
+        assert!(s.on_token_sampled(456));
+        assert!(s.thinking);
+        // </think> flips off but does NOT terminate (no stop token set).
+        assert!(s.on_token_sampled(Slot::THINK_END_TOKEN));
+        assert!(!s.thinking);
+        assert!(s.on_token_sampled(789));
+        assert!(!s.thinking);
+    }
+
+    #[test]
+    fn j6_thinking_close_and_stop_coexist() {
+        // Client added </think> to stop list (non-reasoning client).
+        // Flag must still flip AND generation must terminate.
+        let mut s = Slot::new(0);
+        s.state = SlotState::Generating;
+        s.thinking = true;
+        s.params.stop_tokens = vec![Slot::THINK_END_TOKEN];
+        let cont = s.on_token_sampled(Slot::THINK_END_TOKEN);
+        assert!(!s.thinking, "flag must flip before we decide to stop");
+        assert!(!cont, "stop_tokens must still terminate on </think>");
+    }
+
+    #[test]
+    fn j6_thinking_close_when_not_thinking_is_noop() {
+        let mut s = Slot::new(0);
+        s.state = SlotState::Generating;
+        s.thinking = false;
+        assert!(s.on_token_sampled(Slot::THINK_END_TOKEN));
+        assert!(!s.thinking);
+    }
+
+    #[test]
+    fn j6_try_emit_no_channel_is_false() {
+        let mut s = Slot::new(0);
+        assert!(s.tx.is_none());
+        let ok = s.try_emit(StreamMsg::Token { text: "hi".into(), logprob: None });
+        assert!(!ok, "slot without tx must refuse emit");
+    }
+
+    #[test]
+    fn j6_try_emit_live_channel_succeeds() {
+        let (tx, mut rx) = mpsc::channel::<StreamMsg>(4);
+        let mut s = Slot::new(0);
+        s.tx = Some(tx);
+        let ok = s.try_emit(StreamMsg::Token { text: "hi".into(), logprob: None });
+        assert!(ok);
+        match rx.try_recv().expect("message must be enqueued") {
+            StreamMsg::Token { text, .. } => assert_eq!(text, "hi"),
+            other => panic!("unexpected msg: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn j6_try_emit_closed_channel_returns_false() {
+        // Client drop simulated by dropping the receiver half.
+        let (tx, rx) = mpsc::channel::<StreamMsg>(4);
+        let mut s = Slot::new(0);
+        s.tx = Some(tx);
+        drop(rx);
+        let ok = s.try_emit(StreamMsg::Token { text: "x".into(), logprob: None });
+        assert!(!ok, "closed channel must be detected");
+        // Dispatcher contract: mark_draining immediately with "cancel".
+        s.mark_draining("cancel");
+        assert!(s.is_draining());
+        assert_eq!(s.finish_reason.as_deref(), Some("cancel"));
+    }
+
+    #[test]
+    fn j6_try_emit_full_channel_keeps_slot_alive() {
+        // Slow receiver must NOT be confused with a disconnected one.
+        let (tx, _rx) = mpsc::channel::<StreamMsg>(1);
+        let mut s = Slot::new(0);
+        s.tx = Some(tx.clone());
+        tx.try_send(StreamMsg::Token { text: "fill".into(), logprob: None }).unwrap();
+        // Second send is `Full` — helper must still report success.
+        let ok = s.try_emit(StreamMsg::Token { text: "overflow".into(), logprob: None });
+        assert!(ok, "Full must not be treated as disconnect");
+        assert!(!s.is_draining(), "slow receiver must not kill the slot");
+    }
+
+    #[test]
+    fn j6_state_machine_free_to_draining_to_free() {
+        // Full cycle: Free → Prefilling → Generating → Draining → Free.
+        let mut s = Slot::new(0);
+        assert!(s.is_free());
+        s.state = SlotState::Prefilling { chunks_done: 0 };
+        assert!(!s.is_free());
+        s.state = SlotState::Generating;
+        assert!(!s.is_free());
+        s.mark_draining("stop");
+        assert!(s.is_draining());
+        assert!(!s.is_free());
+        s.mark_free();
+        assert!(s.is_free());
+        assert!(s.finish_reason.is_none());
+        assert!(!s.thinking);
+    }
+
+    #[test]
+    fn j6_slot_reuse_resets_runtime_flags() {
+        // Slot reused for a new request — stale state must NOT leak.
+        let mut s = Slot::new(0);
+        s.state = SlotState::Generating;
+        s.thinking = true;
+        s.params.stop_tokens = vec![1, 2, 3];
+        s.finish_reason = Some("stop".into());
+        s.mark_free();
+        assert!(!s.thinking);
+        assert!(s.finish_reason.is_none());
+    }
+
+    #[test]
+    fn j6_mark_draining_idempotent_state_transition() {
+        // Calling mark_draining twice must leave the slot in Draining,
+        // preserving the FIRST reason.
+        let mut s = Slot::new(0);
+        s.state = SlotState::Generating;
+        s.mark_draining("stop");
+        assert!(s.is_draining());
+        s.mark_draining("cancel");
+        assert!(s.is_draining());
+        assert_eq!(s.finish_reason.as_deref(), Some("stop"));
+    }
 }

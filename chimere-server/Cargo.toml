@@ -75,6 +75,17 @@ name = "j5-smoke"
 path = "src/bin/j5_smoke.rs"
 required-features = ["server"]
 
+# M1 J6 smoke test — rollout safety (stop tokens, </think> flag flip,
+# client-disconnect). Model-free, FFI-free: a synthetic driver thread
+# exercises the Slot state machine, the test drops the rx mid-stream,
+# and the driver must transition to Draining in ≤ 1 scheduler tick /
+# ≤ 100 ms. Validates the per-slot SamplerHandle is NOT dropped on
+# disconnect (would leak/realloc in production).
+[[bin]]
+name = "j6-smoke"
+path = "src/bin/j6_smoke.rs"
+required-features = ["server"]
+
 [profile.release]
 opt-level = 3
 lto = "fat"
