@@ -362,6 +362,42 @@ impl Slot {
         true
     }
 
+    /// Try to emit a `StreamMsg` to the HTTP handler. Returns `true` on
+    /// success, `false` if the channel is closed (client disconnect) or
+    /// the slot has no channel attached.
+    ///
+    /// When this returns `false`, the dispatcher MUST:
+    ///   1. call `mark_draining("cancel")` immediately,
+    ///   2. skip the rest of the current decode step for this slot, and
+    ///   3. let the next scheduler tick reclaim the slot via `mark_free`.
+    ///
+    /// A dropped receiver is the only terminal failure mode of
+    /// `mpsc::Sender::try_send` once the channel has been established.
+    /// `try_send` is used on the sampler-driver path (blocking OS thread,
+    /// not a tokio task) so we don't have to `.await` inside the hot
+    /// decode loop. Back-pressure for slow-but-alive clients is handled
+    /// by treating `Full` as a transient success: we keep the slot alive
+    /// and let the next step try again — the channel buffer drains as
+    /// soon as the receiver side polls.
+    ///
+    /// Rationale for `Full` being non-fatal: the buffered size is 64 and
+    /// an SSE client that lags by more than 64 frames is almost certainly
+    /// about to disconnect. At that point the OS will close the TCP
+    /// connection and the receiver will be dropped, turning the next
+    /// emit into `Closed` — at which point we do kill the slot. This
+    /// keeps a brief network stutter from terminating a healthy stream.
+    pub fn try_emit(&mut self, msg: StreamMsg) -> bool {
+        let tx = match self.tx.as_ref() {
+            Some(tx) => tx,
+            None => return false,
+        };
+        match tx.try_send(msg) {
+            Ok(()) => true,
+            Err(mpsc::error::TrySendError::Full(_)) => true,
+            Err(mpsc::error::TrySendError::Closed(_)) => false,
+        }
+    }
+
     // ------------------------------------------------------------------
     // J5b — per-slot engram bias application
     // ------------------------------------------------------------------
