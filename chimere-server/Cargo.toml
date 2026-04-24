@@ -90,3 +90,11 @@ required-features = ["server"]
 opt-level = 3
 lto = "fat"
 codegen-units = 1
+#   cargo test --release --features server --test concurrent_two_slots
+#   cargo test --release --features server --test concurrent_four_slots
+#   cargo test --release --features server --test slot_queue_backpressure
+#   cargo test --release --features server --test slot_leak_1000
+#
+# If cargo complains about `#[tokio::test(flavor = "multi_thread")]` not
+# finding the `tokio` macro, the `server` feature was forgotten — there
+# is no separate [dev-dependencies] entry for tokio in this crate.
