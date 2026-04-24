@@ -256,6 +256,10 @@ impl Slot {
 
     /// Reset state to `Free`. Does *not* release the libllama KV pages —
     /// that's the caller's job (J5 will wire `llama_kv_cache_seq_rm`).
+    ///
+    /// The per-slot sampler's DRY / repetition history is reset here so the
+    /// slot is ready for a fresh conversation. Engram biases are cleared
+    /// separately (they accumulate per-token anyway).
     pub fn mark_free(&mut self) {
         self.state = SlotState::Free;
         self.pos = 0;
@@ -266,22 +270,133 @@ impl Slot {
         self.request_id.clear();
         self.stats = SlotStats::default();
         self.cancelled.store(false, Ordering::SeqCst);
+        // J5a: reset per-slot sampler state between conversations.
+        if let Some(s) = self.sampler.as_ref() {
+            s.reset();
+            s.clear_engram_bias();
+        }
     }
+
 }
 
 // ---------------------------------------------------------------------------
-// FFI placeholders — J1 keeps them opaque. J5 wires them.
+// FFI handles — J5a wires the sampler, J5b wires the engram
 // ---------------------------------------------------------------------------
 
-/// Opaque handle to a `chimere_sampler` C++ struct. Real definition arrives
-/// in J5. Until then we use `Arc<()>` so the type exists and `Drop` is a
-/// no-op.
-#[derive(Debug, Clone)]
-pub struct SamplerHandle(pub Arc<()>);
+/// Owning handle to a C++ `chimere_sampler` allocated by
+/// [`llama_backend::chimere_sampler_alloc`]. Each active slot owns one so
+/// that logit biases, DRY history, and repetition counters are **per-slot**.
+///
+/// The pointer is freed on drop via `chimere_sampler_free_handle`, so the
+/// handle must NEVER be `Clone`. It is `Send` because the FFI side has no
+/// thread-local state of its own — the scheduler worker thread uses the
+/// handle concurrently with the admitting HTTP thread only through the
+/// mpsc channel (ownership transfer, not shared mutation).
+///
+/// NOTE on safety: the handle is only usable while the `LlamaForward` that
+/// allocated it is alive. In practice the slot pool is owned by the same
+/// `AppState` that owns the model, so the two lifetimes are coupled.
+pub struct SamplerHandle {
+    raw: *mut std::ffi::c_void,
+}
 
-/// Opaque handle to a `MultiEngramLookup` tree. Real definition arrives in J5.
-#[derive(Debug, Clone)]
-pub struct EngramHandle(pub Arc<()>);
+impl SamplerHandle {
+    /// Wrap a raw pointer returned by `chimere_sampler_alloc`. `null` is
+    /// accepted and treated as "no-op sampler"; all operations below then
+    /// degrade silently so callers do not need to special-case it.
+    ///
+    /// # Safety
+    /// `raw` must either be null or a valid pointer returned by
+    /// `chimere_sampler_alloc`. The returned handle takes ownership and
+    /// will free the pointer on drop.
+    pub unsafe fn from_raw(raw: *mut std::ffi::c_void) -> Self {
+        Self { raw }
+    }
+
+    /// `true` when a real C++ sampler is attached.
+    pub fn is_active(&self) -> bool {
+        !self.raw.is_null()
+    }
+
+    /// Raw pointer for FFI calls (e.g. `LlamaForward::sample_slot`).
+    ///
+    /// # Safety
+    /// Caller must not free the returned pointer — ownership remains with
+    /// this `SamplerHandle`.
+    pub unsafe fn as_raw(&self) -> *mut std::ffi::c_void {
+        self.raw
+    }
+
+    /// Reset DRY / repetition history on this slot's sampler (e.g. between
+    /// conversations served on the same slot).
+    pub fn reset(&self) {
+        if self.raw.is_null() {
+            return;
+        }
+        unsafe { crate::llama_backend::chimere_sampler_reset_handle(self.raw); }
+    }
+
+    /// Clear only Engram biases (preserve manual `-inf` biases like
+    /// `</think>` suppression).
+    pub fn clear_engram_bias(&self) {
+        if self.raw.is_null() {
+            return;
+        }
+        unsafe { crate::llama_backend::chimere_sampler_clear_engram_bias_handle(self.raw); }
+    }
+}
+
+impl Drop for SamplerHandle {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { crate::llama_backend::chimere_sampler_free_handle(self.raw); }
+            self.raw = std::ptr::null_mut();
+        }
+    }
+}
+
+// Safety: chimere_sampler has no thread-local state of its own; the only
+// constraint is that the underlying `llama_context` is single-threaded,
+// which is enforced by the scheduler's one-OS-thread-drives-decode design.
+unsafe impl Send for SamplerHandle {}
+
+impl std::fmt::Debug for SamplerHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SamplerHandle")
+            .field("active", &self.is_active())
+            .finish()
+    }
+}
+
+/// Per-slot reference to the globally loaded `MultiEngramLookup` tree plus
+/// an engram blending strength `alpha`. Concretely, we wrap an `Arc` around
+/// the lookup so all slots share the mmap'd `.engr` tables (no duplication)
+/// but each slot can run with its own alpha.
+///
+/// The engram tables themselves are read-only after boot; only the biases
+/// applied to the sampler are per-slot — that isolation lives in
+/// `Slot::apply_engram_bias_to_sampler()` (J5b).
+#[derive(Clone)]
+pub struct EngramHandle {
+    pub lookup: Arc<crate::engram_lookup::MultiEngramLookup>,
+    pub alpha: f32,
+}
+
+impl EngramHandle {
+    pub fn new(lookup: Arc<crate::engram_lookup::MultiEngramLookup>, alpha: f32) -> Self {
+        Self { lookup, alpha }
+    }
+}
+
+impl std::fmt::Debug for EngramHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EngramHandle")
+            .field("n_tables", &self.lookup.len())
+            .field("order", &self.lookup.order())
+            .field("alpha", &self.alpha)
+            .finish()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // SlotPool
@@ -329,6 +444,77 @@ impl SlotPool {
     pub fn num_active(&self) -> usize {
         self.slots.iter().filter(|s| !s.is_free()).count()
     }
+
+    /// J5a — allocate one independent C++ sampler per slot.
+    ///
+    /// Each slot gets its own `chimere_sampler` with the production
+    /// Qwen3.5 thinking-mode defaults (same values as the single-slot path
+    /// in `LlamaForward::new`). The sampler handle takes ownership and
+    /// frees itself on slot drop, so pool lifetime drives sampler
+    /// lifetime — no explicit cleanup needed outside of `mark_free()`
+    /// which only resets state, not memory.
+    ///
+    /// # Parameters
+    ///
+    /// - `model_ptr` is the `*const LlamaModel` obtained via
+    ///   `LlamaForward::model_raw()`. Must be valid for the lifetime of
+    ///   this pool.
+    /// - `temperature`, `top_p`, `top_k`, `min_p`, `presence_penalty` are
+    ///   the initial defaults; per-request overrides still happen via
+    ///   `Slot.params` at admission time (J6 backlog — today only the
+    ///   defaults are used).
+    ///
+    /// Returns `Ok(n_allocated)` on success, `Err(msg)` if any slot's
+    /// allocation fails (in which case *all* previously allocated handles
+    /// are dropped to keep the pool in a clean "no sampler" state).
+    ///
+    /// # Safety
+    /// `model_ptr` must be a valid pointer from `LlamaForward::model_raw()`.
+    /// The caller is responsible for ensuring the `LlamaForward` outlives
+    /// the `SlotPool`.
+    pub unsafe fn alloc_samplers(
+        &mut self,
+        model_ptr: *const crate::llama_backend::LlamaModel,
+        temperature: f32,
+        top_p: f32,
+        top_k: i32,
+        min_p: f32,
+        presence_penalty: f32,
+    ) -> Result<usize, String> {
+        if model_ptr.is_null() {
+            return Err("alloc_samplers: model_ptr is null".into());
+        }
+        let mut allocated = 0usize;
+        let mut failed_slot_id: Option<u32> = None;
+        for slot in self.slots.iter_mut() {
+            let raw = crate::llama_backend::chimere_sampler_alloc(
+                model_ptr,
+                temperature,
+                top_p,
+                top_k,
+                min_p,
+                presence_penalty,
+            );
+            if raw.is_null() {
+                failed_slot_id = Some(slot.id);
+                break;
+            }
+            slot.sampler = Some(SamplerHandle::from_raw(raw));
+            allocated += 1;
+        }
+        if let Some(id) = failed_slot_id {
+            // Drop all previously allocated handles to avoid leaking C++ state.
+            for s in self.slots.iter_mut() {
+                s.sampler = None;
+            }
+            return Err(format!(
+                "chimere_sampler_alloc returned null for slot {} (allocated {} before failure)",
+                id, allocated,
+            ));
+        }
+        Ok(allocated)
+    }
+
 }
 
 // ---------------------------------------------------------------------------
