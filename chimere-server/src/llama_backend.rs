@@ -432,6 +432,36 @@ pub unsafe fn chimere_sampler_alloc(
     )
 }
 
+/// Like [`chimere_sampler_alloc`] but lets the caller override DRY
+/// parameters. Use `dry_multiplier = 0.0` to disable DRY entirely —
+/// useful for smoke tests that don't need repetition penalties, and for
+/// smaller models whose tokenizer cannot resolve the default DRY
+/// sequence-breakers (`\n`, `:`, `"`, `*`) without running into
+/// `llama_sampler_init_dry`'s tokenisation path.
+///
+/// # Safety
+/// Same as `chimere_sampler_alloc` — `model` must be a valid pointer
+/// from `LlamaForward::model_raw()`.
+pub unsafe fn chimere_sampler_alloc_with_dry(
+    model: *const LlamaModel,
+    temperature: f32,
+    top_p: f32,
+    top_k: i32,
+    min_p: f32,
+    presence_penalty: f32,
+    dry_multiplier: f32,
+    dry_base: f32,
+    dry_min_length: i32,
+    dry_penalty_last_n: i32,
+) -> *mut c_void {
+    chimere_sampler_init(
+        model,
+        temperature, top_p, top_k,
+        min_p, presence_penalty,
+        dry_multiplier, dry_base, dry_min_length, dry_penalty_last_n,
+    )
+}
+
 /// Free a sampler handle allocated by [`chimere_sampler_alloc`] or by the
 /// built-in constructor in `LlamaForward::new`.
 ///
@@ -462,6 +492,42 @@ pub unsafe fn chimere_sampler_reset_handle(sampler: *mut c_void) {
 pub unsafe fn chimere_sampler_clear_engram_bias_handle(sampler: *mut c_void) {
     if !sampler.is_null() {
         chimere_sampler_clear_engram_bias(sampler);
+    }
+}
+
+/// Push Engram biases into a per-slot sampler. `token_ids` and `biases`
+/// must be parallel arrays of length `n_entries`. Merges with existing
+/// biases — manual suppressions (e.g. `</think>` at `-inf`) are preserved;
+/// previous Engram entries are overwritten. See `chimere_sampler.cpp` for
+/// the exact merge semantics.
+///
+/// # Safety
+/// `sampler` must be a valid handle. `token_ids` / `biases` must point to
+/// arrays of at least `n_entries` elements, readable for the duration of
+/// the call. Null sampler is a silent no-op.
+pub unsafe fn chimere_sampler_set_engram_bias_handle(
+    sampler: *mut c_void,
+    token_ids: *const i32,
+    biases: *const f32,
+    n_entries: c_int,
+) {
+    if !sampler.is_null() && n_entries > 0 {
+        chimere_sampler_set_engram_bias(sampler, token_ids, biases, n_entries);
+    }
+}
+
+/// Set a single logit bias (e.g. `-inf` for `</think>` suppression) on a
+/// per-slot sampler.
+///
+/// # Safety
+/// `sampler` must be a valid handle.
+pub unsafe fn chimere_sampler_set_logit_bias_handle(
+    sampler: *mut c_void,
+    token_id: i32,
+    bias: f32,
+) {
+    if !sampler.is_null() {
+        chimere_sampler_set_logit_bias(sampler, token_id, bias);
     }
 }
 
@@ -692,7 +758,17 @@ impl LlamaForward {
         // construction. Useful when exercising forward_multi_seq alone (j3-smoke
         // does argmax externally and doesn't need the chimere sampler). Also
         // avoids the libcommon grammar-path symbol that ik_llama doesn't expose.
-        let sampler = if std::env::var("CHIMERE_SKIP_SAMPLER_INIT").is_ok() {
+        //
+        // Value "0" or "false" means DO NOT skip — allocate normally. This
+        // matters for j5-smoke which sets the var to 0 to force sampler
+        // allocation even when the invoking shell had it set to 1.
+        let skip_sampler = std::env::var("CHIMERE_SKIP_SAMPLER_INIT")
+            .map(|v| {
+                let v = v.trim();
+                !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("false"))
+            })
+            .unwrap_or(false);
+        let sampler = if skip_sampler {
             eprintln!("[LLAMA_BACKEND] CHIMERE_SKIP_SAMPLER_INIT=1 → skipping C++ sampler");
             std::ptr::null_mut()
         } else {
@@ -1380,6 +1456,37 @@ impl LlamaForward {
         let tok = chimere_sampler_sample(sampler, self.ctx, batch_idx as c_int);
         chimere_sampler_accept(sampler, self.ctx, tok);
         tok as u32
+    }
+
+    /// Sample at `batch_idx` using a per-slot sampler AND return top-5
+    /// logprobs reflecting the sampler's current logit-bias state. The
+    /// J5 smoke uses this to observe that per-slot engram biases yield
+    /// distinct distributions across slots (not just distinct argmaxes).
+    ///
+    /// # Safety
+    /// `sampler` must be a valid pointer returned by
+    /// `chimere_sampler_init(...)` and bound to this model's context.
+    pub unsafe fn sample_slot_with_logprobs(
+        &self,
+        sampler: *mut c_void,
+        batch_idx: usize,
+    ) -> (u32, Vec<TokenLogprob>) {
+        let mut result = ChimereLogprobResult {
+            token_id: 0,
+            n_top: 0,
+            top_tokens: [0; 5],
+            top_logprobs: [0.0; 5],
+        };
+        chimere_sampler_sample_with_logprobs(sampler, self.ctx, batch_idx as c_int, &mut result);
+        chimere_sampler_accept(sampler, self.ctx, result.token_id);
+        let mut logprobs = Vec::with_capacity(result.n_top as usize);
+        for i in 0..result.n_top as usize {
+            logprobs.push(TokenLogprob {
+                token: result.top_tokens[i] as u32,
+                logprob: result.top_logprobs[i],
+            });
+        }
+        (result.token_id as u32, logprobs)
     }
 
     /// Rollback position counter by n tokens.

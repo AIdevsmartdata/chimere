@@ -277,6 +277,76 @@ impl Slot {
         }
     }
 
+    // ------------------------------------------------------------------
+    // J5b — per-slot engram bias application
+    // ------------------------------------------------------------------
+
+    /// Append `token` to the bounded `recent_context` window used for
+    /// engram lookups and DRY penalty. The window is capped at 256 tokens
+    /// to keep lookup cost O(order=5..8) regardless of generation length.
+    pub fn push_context(&mut self, token: u32) {
+        const MAX_CONTEXT: usize = 256;
+        self.recent_context.push(token);
+        if self.recent_context.len() > MAX_CONTEXT {
+            let drop = self.recent_context.len() - MAX_CONTEXT;
+            self.recent_context.drain(0..drop);
+        }
+    }
+
+    /// Look up the slot's engram table using its `recent_context` and push
+    /// the resulting biases into the slot's sampler. No-op if either the
+    /// engram or the sampler is unset. Biases already installed by other
+    /// code paths (e.g. `</think>` suppression at `-inf`) are preserved;
+    /// see `chimere_sampler_set_engram_bias` in `ffi/chimere_sampler.cpp`
+    /// for the exact merge semantics.
+    ///
+    /// Biases are computed as `alpha * ln(prob + 1e-10)` to match the
+    /// existing production pipeline (see `mtp_scheduler.rs`).
+    ///
+    /// This is the method the multi-slot scheduler will call once per
+    /// generate step, right before invoking `LlamaForward::sample_slot`.
+    pub fn apply_engram_bias_to_sampler(&self) {
+        let (engram, sampler) = match (&self.engram, &self.sampler) {
+            (Some(e), Some(s)) if s.is_active() => (e, s),
+            _ => return,
+        };
+        // `engram_alpha` overrides the handle's default when set non-zero
+        // by the admission path (per-request). Otherwise fall back to the
+        // per-handle alpha that was attached via `SlotPool::attach_engram`.
+        let alpha = if self.engram_alpha > 0.0 {
+            self.engram_alpha
+        } else {
+            engram.alpha
+        };
+        if alpha <= 0.0 {
+            return;
+        }
+        let preds = engram.lookup.lookup(&self.recent_context);
+        if preds.is_empty() {
+            // No n-gram hit for this context window. Clear any stale Engram
+            // bias from the previous token so we don't keep dragging the
+            // sampler toward outdated predictions.
+            sampler.clear_engram_bias();
+            return;
+        }
+
+        // Convert (token, prob) → (token, alpha * ln(prob + eps)). This
+        // matches mtp_scheduler.rs exactly so the two paths stay
+        // numerically equivalent.
+        let token_ids: Vec<i32> = preds.iter().map(|&(t, _)| t as i32).collect();
+        let biases: Vec<f32> = preds
+            .iter()
+            .map(|&(_, p)| alpha * (p + 1e-10).ln())
+            .collect();
+        unsafe {
+            crate::llama_backend::chimere_sampler_set_engram_bias_handle(
+                sampler.as_raw(),
+                token_ids.as_ptr(),
+                biases.as_ptr(),
+                preds.len() as std::ffi::c_int,
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -481,19 +551,49 @@ impl SlotPool {
         min_p: f32,
         presence_penalty: f32,
     ) -> Result<usize, String> {
+        // Defer to the DRY-configurable variant with production defaults
+        // (dry_multiplier=0.8, matching LlamaForward::new's built-in sampler).
+        self.alloc_samplers_with_dry(
+            model_ptr,
+            temperature, top_p, top_k, min_p, presence_penalty,
+            0.8,   // dry_multiplier
+            1.75,  // dry_base
+            2,     // dry_min_length
+            -1,    // dry_penalty_last_n
+        )
+    }
+
+    /// Like [`SlotPool::alloc_samplers`] but with DRY parameters exposed.
+    /// Set `dry_multiplier = 0.0` to allocate a sampler with DRY
+    /// effectively disabled — required for smoke tests on models whose
+    /// vocab cannot tokenise the default DRY sequence-breakers.
+    ///
+    /// # Safety
+    /// `model_ptr` must be a valid pointer from `LlamaForward::model_raw()`.
+    pub unsafe fn alloc_samplers_with_dry(
+        &mut self,
+        model_ptr: *const crate::llama_backend::LlamaModel,
+        temperature: f32,
+        top_p: f32,
+        top_k: i32,
+        min_p: f32,
+        presence_penalty: f32,
+        dry_multiplier: f32,
+        dry_base: f32,
+        dry_min_length: i32,
+        dry_penalty_last_n: i32,
+    ) -> Result<usize, String> {
         if model_ptr.is_null() {
             return Err("alloc_samplers: model_ptr is null".into());
         }
         let mut allocated = 0usize;
         let mut failed_slot_id: Option<u32> = None;
         for slot in self.slots.iter_mut() {
-            let raw = crate::llama_backend::chimere_sampler_alloc(
+            let raw = crate::llama_backend::chimere_sampler_alloc_with_dry(
                 model_ptr,
-                temperature,
-                top_p,
-                top_k,
-                min_p,
-                presence_penalty,
+                temperature, top_p, top_k,
+                min_p, presence_penalty,
+                dry_multiplier, dry_base, dry_min_length, dry_penalty_last_n,
             );
             if raw.is_null() {
                 failed_slot_id = Some(slot.id);
@@ -515,6 +615,44 @@ impl SlotPool {
         Ok(allocated)
     }
 
+    /// J5b — attach a shared engram lookup to every slot with the given
+    /// blending alpha. Slots start with `None` engram; this is the opt-in
+    /// that lights up per-slot engram biasing in `Slot::apply_engram_bias_to_sampler`.
+    ///
+    /// The same `Arc` is cloned into each slot — tables are memory-mapped
+    /// and read-only, so sharing is zero-copy. Per-slot `engram_alpha`
+    /// (set by admission) overrides the handle's default.
+    pub fn attach_engram(
+        &mut self,
+        lookup: Arc<crate::engram_lookup::MultiEngramLookup>,
+        alpha: f32,
+    ) {
+        for slot in self.slots.iter_mut() {
+            slot.engram = Some(EngramHandle::new(Arc::clone(&lookup), alpha));
+        }
+    }
+
+    /// J5b — attach a distinct engram lookup per slot. Useful for tests
+    /// and for future multi-tenant setups where each slot represents a
+    /// different domain (kine / cyber / research). `lookups.len()` must
+    /// equal `self.len()` or the function returns Err.
+    pub fn attach_engram_per_slot(
+        &mut self,
+        lookups: Vec<Arc<crate::engram_lookup::MultiEngramLookup>>,
+        alpha: f32,
+    ) -> Result<(), String> {
+        if lookups.len() != self.slots.len() {
+            return Err(format!(
+                "attach_engram_per_slot: got {} lookups for {} slots",
+                lookups.len(),
+                self.slots.len(),
+            ));
+        }
+        for (slot, lookup) in self.slots.iter_mut().zip(lookups.into_iter()) {
+            slot.engram = Some(EngramHandle::new(lookup, alpha));
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
