@@ -1,0 +1,22 @@
+{
+  "engine": "chimere-deltanet",
+  "metrics": {
+    "admission_queue_depth": 0,
+    "gen_tokens_total": 0,
+    "prompt_tokens_total": 783,
+    "requests_error": 0,
+    "requests_ok": 41,
+    "slot_occupancy": 0,
+    "slot_pool_size": 2,
+    "ttft": {
+      "count": 41,
+      "p50_ms": 3509,
+      "p90_ms": 3553,
+      "p95_ms": 3556,
+      "p99_ms": 3564
+    }
+  },
+  "model": "chimere-deltanet",
+  "scheduler_mode": "native",
+  "status": "ok"
+}

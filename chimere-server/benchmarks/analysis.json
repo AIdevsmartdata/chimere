@@ -1,0 +1,236 @@
+{
+  "M1": {
+    "prom_deltas": {
+      "requests_ok": 41.0,
+      "requests_error": 0.0,
+      "prompt_tokens_total": 783.0,
+      "gen_tokens_total": 0.0
+    },
+    "ttft_prom": {
+      "p50_s": 4.108,
+      "p90_s": 4.166,
+      "p95_s": 4.218,
+      "p99_s": 4.297,
+      "sum_s": 157.186,
+      "count": 41.0
+    },
+    "dmon": {
+      "n_samples": 62,
+      "sm_util_pct_all": {
+        "mean": 73.89,
+        "p50": 88.0,
+        "p95": 89.0,
+        "max": 90.0
+      },
+      "mem_util_pct_all": {
+        "mean": 45.0,
+        "p50": 55.0,
+        "p95": 57.0,
+        "max": 58.0
+      },
+      "sm_util_pct_active_only": {
+        "mean": 88.1,
+        "p50": 89.0,
+        "p95": 90.0,
+        "max": 90.0
+      },
+      "power_w": {
+        "mean": 111.52,
+        "p50": 129.0,
+        "p95": 132.0,
+        "max": 133.0
+      },
+      "mclk_mhz": {
+        "mean": 13801.0,
+        "p50": 13801.0,
+        "p95": 13801.0,
+        "max": 13801.0
+      },
+      "pclk_mhz": {
+        "mean": 2694.73,
+        "p50": 2700.0,
+        "p95": 2737.0,
+        "max": 2782.0
+      },
+      "rxpci_mbps": {
+        "mean": 4.44,
+        "p50": 3.0,
+        "p95": 3.0,
+        "max": 55.0
+      },
+      "txpci_mbps": {
+        "mean": 87.39,
+        "p50": 107.0,
+        "p95": 108.0,
+        "max": 108.0
+      },
+      "fraction_active_seconds": 0.839
+    },
+    "jsonl_extra": {
+      "n_ok": 40,
+      "ttft_ms_mean": 3925.0,
+      "ttft_ms_stdev": 779.98,
+      "finish_breakdown": {
+        "stop": 40
+      },
+      "tokens_per_req_mean": 128,
+      "body_len_mean": 452.05
+    }
+  },
+  "M2": {
+    "prom_deltas": {
+      "requests_ok": 41.0,
+      "requests_error": 0.0,
+      "prompt_tokens_total": 783.0,
+      "gen_tokens_total": 0.0
+    },
+    "ttft_prom": {
+      "p50_s": 3.509,
+      "p90_s": 3.553,
+      "p95_s": 3.556,
+      "p99_s": 3.564,
+      "sum_s": 133.878,
+      "count": 41.0
+    },
+    "dmon": {
+      "n_samples": 78,
+      "sm_util_pct_all": {
+        "mean": 68.6,
+        "p50": 80.0,
+        "p95": 83.0,
+        "max": 93.0
+      },
+      "mem_util_pct_all": {
+        "mean": 22.54,
+        "p50": 27.0,
+        "p95": 28.0,
+        "max": 29.0
+      },
+      "sm_util_pct_active_only": {
+        "mean": 79.87,
+        "p50": 80.0,
+        "p95": 83.0,
+        "max": 93.0
+      },
+      "power_w": {
+        "mean": 87.29,
+        "p50": 98.0,
+        "p95": 101.0,
+        "max": 102.0
+      },
+      "mclk_mhz": {
+        "mean": 13801.0,
+        "p50": 13801.0,
+        "p95": 13801.0,
+        "max": 13801.0
+      },
+      "pclk_mhz": {
+        "mean": 2731.51,
+        "p50": 2737.0,
+        "p95": 2782.0,
+        "max": 2797.0
+      },
+      "rxpci_mbps": {
+        "mean": 399.55,
+        "p50": 255.0,
+        "p95": 312.0,
+        "max": 13624.0
+      },
+      "txpci_mbps": {
+        "mean": 130.91,
+        "p50": 157.0,
+        "p95": 164.0,
+        "max": 977.0
+      },
+      "fraction_active_seconds": 0.859
+    },
+    "jsonl_extra": {
+      "n_ok": 40,
+      "ttft_ms_mean": 3340.87,
+      "ttft_ms_stdev": 759.6,
+      "finish_breakdown": {
+        "length": 40
+      },
+      "tokens_per_req_mean": 128,
+      "body_len_mean": 468.38
+    }
+  },
+  "M4": {
+    "prom_deltas": {
+      "requests_ok": 41.0,
+      "requests_error": 0.0,
+      "prompt_tokens_total": 783.0,
+      "gen_tokens_total": 0.0
+    },
+    "ttft_prom": {
+      "p50_s": 0.13,
+      "p90_s": 0.176,
+      "p95_s": 0.177,
+      "p99_s": 0.207,
+      "sum_s": 4.678,
+      "count": 41.0
+    },
+    "dmon": {
+      "n_samples": 65,
+      "sm_util_pct_all": {
+        "mean": 60.0,
+        "p50": 75.0,
+        "p95": 80.0,
+        "max": 84.0
+      },
+      "mem_util_pct_all": {
+        "mean": 17.94,
+        "p50": 23.0,
+        "p95": 24.0,
+        "max": 27.0
+      },
+      "sm_util_pct_active_only": {
+        "mean": 76.47,
+        "p50": 77.0,
+        "p95": 80.0,
+        "max": 84.0
+      },
+      "power_w": {
+        "mean": 86.51,
+        "p50": 102.0,
+        "p95": 105.0,
+        "max": 106.0
+      },
+      "mclk_mhz": {
+        "mean": 13801.0,
+        "p50": 13801.0,
+        "p95": 13801.0,
+        "max": 13801.0
+      },
+      "pclk_mhz": {
+        "mean": 2716.32,
+        "p50": 2730.0,
+        "p95": 2745.0,
+        "max": 2797.0
+      },
+      "rxpci_mbps": {
+        "mean": 196.6,
+        "p50": 213.0,
+        "p95": 320.0,
+        "max": 344.0
+      },
+      "txpci_mbps": {
+        "mean": 110.23,
+        "p50": 66.0,
+        "p95": 264.0,
+        "max": 374.0
+      },
+      "fraction_active_seconds": 0.785
+    },
+    "jsonl_extra": {
+      "n_ok": 40,
+      "ttft_ms_mean": 114.63,
+      "ttft_ms_stdev": 49.16,
+      "finish_breakdown": {
+        "length": 40
+      },
+      "tokens_per_req_mean": 128,
+      "body_len_mean": 464.6
+    }
+  }
+}

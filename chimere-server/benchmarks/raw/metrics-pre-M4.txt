@@ -1,0 +1,24 @@
+# HELP chimere_requests_total Total chat-completion requests by terminal status
+# TYPE chimere_requests_total counter
+chimere_requests_total{status="ok"} 0
+chimere_requests_total{status="error"} 0
+
+# HELP chimere_prompt_tokens_total Prompt tokens tokenised across all accepted requests
+# TYPE chimere_prompt_tokens_total counter
+chimere_prompt_tokens_total 0
+
+# HELP chimere_gen_tokens_total Tokens produced by the model across all requests
+# TYPE chimere_gen_tokens_total counter
+chimere_gen_tokens_total 0
+
+# HELP chimere_slot_occupancy Slots currently serving a request
+# TYPE chimere_slot_occupancy gauge
+chimere_slot_occupancy 0
+
+# HELP chimere_slot_pool_size Total slots configured on this server instance
+# TYPE chimere_slot_pool_size gauge
+chimere_slot_pool_size 4
+
+# HELP chimere_admission_queue_depth Requests parked in the admission mpsc channel
+# TYPE chimere_admission_queue_depth gauge
+chimere_admission_queue_depth 0
