@@ -1121,6 +1121,22 @@ pub struct NativeScheduler {
     /// `/metrics` scrape and `/v1/status` handlers. `Relaxed` is sufficient
     /// — observability gauge, eventual consistency is fine.
     active_count: Arc<AtomicUsize>,
+
+    // ---------- M2-J2c — prompt-prefix cache wiring ----------
+    /// Optional prompt-prefix cache. `None` when `CHIMERE_PREFIX_CACHE=0`
+    /// (bit-identical to M1 behaviour).
+    ///
+    /// Shared behind `Arc<RwLock<...>>` so the `/v1/prefix_cache_stats`
+    /// endpoint (M2-J6) can read without blocking the driver, and so
+    /// multiple drivers (future: prefill vs decode split) could share
+    /// one trie without rewrites.
+    prefix_trie: Option<Arc<std::sync::RwLock<crate::prefix_cache::PrefixTrie>>>,
+
+    /// Gate derived from `CacheConfig::from_env().enabled` at construction
+    /// time AND the presence of a `prefix_trie`. When `false`, every trie
+    /// touch is skipped even if `prefix_trie` is `Some(...)` — belt-and-
+    /// braces kill switch for rollback scenarios.
+    prefix_cache_enabled: bool,
 }
 
 impl NativeScheduler {
@@ -1168,7 +1184,48 @@ impl NativeScheduler {
             default_engram_alpha,
             shutdown: Arc::new(AtomicBool::new(false)),
             active_count: Arc::new(AtomicUsize::new(0)),
+            // M2-J2c: prefix cache is off by default; install via `with_prefix_cache`.
+            prefix_trie: None,
+            prefix_cache_enabled: false,
         })
+    }
+
+    /// M2-J2c — attach a prompt-prefix cache trie to this scheduler.
+    ///
+    /// Must be called BEFORE [`spawn_native_driver`](Self::spawn_native_driver),
+    /// otherwise the driver closure has already captured `prefix_trie: None`
+    /// and no subsequent change is observed.
+    ///
+    /// # Gate semantics (kill switch)
+    ///
+    /// The effective "cache on" state requires both:
+    /// 1. `trie.is_some()` (caller actually passed a trie in), AND
+    /// 2. [`CacheConfig::from_env()`](crate::prefix_cache::CacheConfig::from_env)
+    ///    reports `enabled == true` (i.e. `CHIMERE_PREFIX_CACHE=1` and
+    ///    non-zero byte/node budgets).
+    ///
+    /// When (1) is true but (2) is false, the trie is kept (so
+    /// `/v1/prefix_cache_stats` still shows the empty trie) but the hot
+    /// paths in `NativeDriver` skip every cache operation — a warning is
+    /// logged to make the discrepancy visible at review time.
+    ///
+    /// When `None` is passed, behaviour is bit-identical to M1
+    /// (no trie touch, no FFI save/restore, no gate check at all).
+    pub fn with_prefix_cache(
+        mut self,
+        trie: Option<Arc<std::sync::RwLock<crate::prefix_cache::PrefixTrie>>>,
+    ) -> Self {
+        let cfg_enabled = crate::prefix_cache::CacheConfig::from_env().enabled;
+        let enabled = trie.is_some() && cfg_enabled;
+        if trie.is_some() && !cfg_enabled {
+            eprintln!(
+                "[slot_scheduler:native] prefix_trie provided but \
+                 CHIMERE_PREFIX_CACHE disabled — cache inert (bit-identical to M1)"
+            );
+        }
+        self.prefix_trie = trie;
+        self.prefix_cache_enabled = enabled;
+        self
     }
 
     /// Clone the admission sender. HTTP handlers use this to enqueue
@@ -1242,10 +1299,20 @@ impl NativeScheduler {
             .and_then(|s| s.parse().ok())
             .unwrap_or(256);
 
+        // M2-J2c — snapshot the prefix-cache handle + gate for the driver
+        // thread. Clone `Arc` (cheap, bumps a refcount). When the gate is
+        // off, `prefix_trie` may still be Some(...) for `/v1/prefix_cache_stats`
+        // readers, but the driver hot paths skip every trie touch.
+        let prefix_trie = self.prefix_trie.clone();
+        let prefix_cache_enabled = self.prefix_cache_enabled;
+
         eprintln!(
             "[slot_scheduler:native] driver spawning: num_slots={}, tick_us={}, \
-             max_prefill_chunk={}, engram_attached={}",
-            num_slots, tick_us, max_prefill_chunk, engram_global.is_some(),
+             max_prefill_chunk={}, engram_attached={}, prefix_cache_enabled={}, \
+             prefix_trie_attached={}",
+            num_slots, tick_us, max_prefill_chunk,
+            engram_global.is_some(),
+            prefix_cache_enabled, prefix_trie.is_some(),
         );
 
         let handle = std::thread::Builder::new()
@@ -1259,6 +1326,8 @@ impl NativeScheduler {
                     max_prefill_chunk,
                     tick_us,
                     active_count,
+                    prefix_trie,
+                    prefix_cache_enabled,
                 };
                 driver.run();
             })
@@ -1281,6 +1350,17 @@ struct NativeDriver {
     /// so the `/metrics` scrape sees a live occupancy gauge rather than
     /// a hardcoded zero.
     active_count: Arc<AtomicUsize>,
+
+    // ---------- M2-J2c — prompt-prefix cache ----------
+    /// Optional shared trie. Reads/writes go through an `RwLock` so the
+    /// stats endpoint (M2-J6) and the driver can coexist without lock
+    /// contention on the hot read path.
+    prefix_trie: Option<Arc<std::sync::RwLock<crate::prefix_cache::PrefixTrie>>>,
+    /// Gate: when `false`, every cache touch is skipped. Equivalent to
+    /// `prefix_trie.is_none()` at steady state, but kept separately so
+    /// operators can run with a live trie but inert cache during rollback
+    /// smoke-tests (belt-and-braces).
+    prefix_cache_enabled: bool,
 }
 
 impl NativeDriver {
@@ -1376,6 +1456,33 @@ impl NativeDriver {
 
     /// Seat a new request in the first free slot. Caller MUST have
     /// verified a free slot is available via `alloc_free().is_some()`.
+    ///
+    /// # M2-J2c — prompt-prefix cache admission
+    ///
+    /// When the prefix cache is enabled (both `self.prefix_cache_enabled`
+    /// and `self.prefix_trie.is_some()`), this method:
+    ///
+    /// 1. Looks up the longest prefix of the new request's `prompt_tokens`
+    ///    already present in the trie (`longest_prefix` under a short
+    ///    write-lock — the call updates `last_hit` for LRU).
+    /// 2. On hit (`n_hit > 0`), calls
+    ///    [`LlamaForward::restore_seq_state`] + [`set_pos`] to rehydrate
+    ///    the KV/GDN state into the slot's `seq_id`. The blob is
+    ///    seq_id-independent (see M2-J2b doc).
+    /// 3. Computes `chunks_done = n_hit / max_prefill_chunk` and
+    ///    `rounded_skip = chunks_done * max_prefill_chunk`. If the hit is
+    ///    sub-chunk-aligned (`n_hit % max_prefill_chunk != 0`), the restore
+    ///    is REVERTED (clear seq, reset pos) because ik_llama has no
+    ///    `kv_cache_seq_rm(p0, p1)` for partial-chunk trims. Safe default
+    ///    = cold start.
+    /// 4. On any FFI error, clears the seq and falls back to cold.
+    /// 5. The full `prompt_tokens` are pushed into `recent_context`
+    ///    regardless of hit/miss, so the engram n-gram lookup behaves
+    ///    identically on warm paths (per M2 plan § 5).
+    ///
+    /// Kill-switch: when `self.prefix_cache_enabled == false` (or the
+    /// trie is None), this method reduces to the original M1 body —
+    /// no RwLock touch, no FFI save/restore, no log noise.
     fn seat_request(&mut self, req: NativeScheduledRequest) {
         // Defense: an empty prompt would cause `end-start-1` to underflow
         // in `tick_prefill_one`. Reject loudly, don't silently hang.
@@ -1388,43 +1495,174 @@ impl NativeDriver {
             });
             return;
         }
-        let free = match self.pool.alloc_free() {
+
+        // Fill request-scoped fields first, inside a scoped block so the
+        // `&mut Slot` borrow on `self.pool` ends before we reach the FFI
+        // calls below. We DELIBERATELY do not touch `state` / `pos` here —
+        // those may be adjusted by the prefix-cache hit path.
+        let (slot_id, prompt_tokens_clone): (u32, Vec<u32>) = {
+            let free = match self.pool.alloc_free() {
+                Some(s) => s,
+                None => {
+                    // Shouldn't happen given the caller's precondition, but
+                    // defend by sending an Error and moving on.
+                    let _ = req.tx.try_send(StreamMsg::Error {
+                        message: "No free slot after admission — race condition".to_string(),
+                    });
+                    return;
+                }
+            };
+            eprintln!(
+                "[slot_scheduler:native] seat req={} on slot {} (prompt={} toks, max={}, wait_ms={})",
+                req.request_id,
+                free.id,
+                req.prompt_tokens.len(),
+                req.params.max_tokens,
+                req.enqueued_at.elapsed().as_millis(),
+            );
+            // Reset slot to a clean state (defensive — mark_free was called
+            // when the previous tenant vacated).
+            free.mark_free();
+            free.prompt_tokens = req.prompt_tokens;
+            free.params = req.params;
+            free.engram_alpha = req.engram_alpha;
+            free.tx = Some(req.tx);
+            free.want_logprobs = req.want_logprobs;
+            free.request_id = req.request_id;
+            free.cancelled = req.cancelled;
+            free.thinking = free.params.enable_thinking;
+            free.stats.prompt_tokens = free.prompt_tokens.len() as u32;
+
+            let slot_id = free.id;
+            let prompt_tokens_clone = free.prompt_tokens.clone();
+            (slot_id, prompt_tokens_clone)
+            // `free: &mut Slot` dropped here → `self.pool` free again.
+        };
+
+        // -----------------------------------------------------------------
+        // M2-J2c — prefix-cache lookup + restore (gated).
+        //
+        // Outputs of this block:
+        //   * `prefill_skip: usize` = number of prompt tokens already in
+        //     the KV cache after restore. 0 = cold start.
+        //   * On FFI/alignment failure we clear the seq, reset pos, and
+        //     leave `prefill_skip = 0`.
+        // -----------------------------------------------------------------
+        let mut prefill_skip: usize = 0;
+
+        if self.prefix_cache_enabled {
+            if let Some(trie_arc) = self.prefix_trie.as_ref() {
+                // 1. Look up the longest matching prefix under a short
+                //    write-lock (`longest_prefix` updates `last_hit`).
+                //    We intentionally drop the lock BEFORE FFI — the
+                //    restore call is ~ms-scale and must not block stats
+                //    readers.
+                let lookup = match trie_arc.write() {
+                    Ok(mut g) => g.longest_prefix(&prompt_tokens_clone),
+                    Err(poisoned) => {
+                        eprintln!(
+                            "[prefix_cache] trie RwLock poisoned — falling back to cold: {}",
+                            poisoned,
+                        );
+                        None
+                    }
+                };
+
+                // 2. On hit, do the restore + alignment dance.
+                if let Some((n_hit, kv)) = lookup {
+                    if n_hit > 0 {
+                        // Attempt FFI restore. On failure, clear and cold.
+                        let restore_ok = match self.llama.restore_seq_state(
+                            slot_id as i32,
+                            &kv.seq_bytes,
+                        ) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                eprintln!(
+                                    "[prefix_cache] restore_seq_state failed for slot={} n_hit={}: {} \
+                                     — falling back to cold",
+                                    slot_id, n_hit, e,
+                                );
+                                // Paranoia: clear any partial state.
+                                let _ = self.llama.kv_cache_seq_rm_for(slot_id as i32);
+                                false
+                            }
+                        };
+
+                        if restore_ok {
+                            // Chunk alignment — ik_llama's fork has no
+                            // `kv_cache_seq_rm(seq, p0, p1)` API; we can
+                            // only start `tick_prefill_one` at chunk
+                            // boundaries.
+                            let chunks_done = n_hit / self.max_prefill_chunk;
+                            let rounded_skip = chunks_done * self.max_prefill_chunk;
+
+                            if rounded_skip == 0 {
+                                // Hit covers less than one chunk → not
+                                // worth the restore; bail to cold.
+                                eprintln!(
+                                    "[prefix_cache] hit slot={} n_hit={}/{} < max_chunk={} \
+                                     — sub-chunk hit, clearing and starting cold",
+                                    slot_id, n_hit, prompt_tokens_clone.len(),
+                                    self.max_prefill_chunk,
+                                );
+                                let _ = self.llama.kv_cache_seq_rm_for(slot_id as i32);
+                                self.llama.set_pos(0);
+                                prefill_skip = 0;
+                            } else {
+                                self.llama.set_pos(rounded_skip as i32);
+                                prefill_skip = rounded_skip;
+                                eprintln!(
+                                    "[prefix_cache] hit slot={} n_hit={}/{} chunks_done={} \
+                                     rounded_skip={} kv_id={} kv_bytes={}",
+                                    slot_id, n_hit, prompt_tokens_clone.len(),
+                                    chunks_done, rounded_skip,
+                                    kv.id, kv.byte_size(),
+                                );
+                            }
+                        }
+                    } else {
+                        // n_hit == 0 (empty-root hit) — treat as miss.
+                        eprintln!(
+                            "[prefix_cache] miss slot={} prompt_len={} (empty-root hit ignored)",
+                            slot_id, prompt_tokens_clone.len(),
+                        );
+                    }
+                } else {
+                    eprintln!(
+                        "[prefix_cache] miss slot={} prompt_len={}",
+                        slot_id, prompt_tokens_clone.len(),
+                    );
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Re-acquire the slot and seat the request. `chunks_done` =
+        // number of prefill chunks ALREADY consumed by the cache restore.
+        // `tick_prefill_one` will start slicing at
+        // `start = chunks_done * max_prefill_chunk`, naturally skipping
+        // the cached tokens and emitting only the fresh tail.
+        // -----------------------------------------------------------------
+        let chunks_done = prefill_skip / self.max_prefill_chunk;
+        let free = match self.pool.get_mut(slot_id) {
             Some(s) => s,
             None => {
-                // Shouldn't happen given the caller's precondition, but
-                // defend by sending an Error and moving on.
-                let _ = req.tx.try_send(StreamMsg::Error {
-                    message: "No free slot after admission — race condition".to_string(),
-                });
+                // Shouldn't happen — we just mark_free'd this slot.
+                eprintln!(
+                    "[slot_scheduler:native] BUG: slot {} vanished between \
+                     alloc_free and seat_request completion",
+                    slot_id,
+                );
                 return;
             }
         };
-        eprintln!(
-            "[slot_scheduler:native] seat req={} on slot {} (prompt={} toks, max={}, wait_ms={})",
-            req.request_id,
-            free.id,
-            req.prompt_tokens.len(),
-            req.params.max_tokens,
-            req.enqueued_at.elapsed().as_millis(),
-        );
-        // Reset slot to a clean state (defensive — mark_free was called
-        // when the previous tenant vacated).
-        free.mark_free();
-        free.state = SlotState::Prefilling { chunks_done: 0 };
-        free.pos = 0;
-        free.prompt_tokens = req.prompt_tokens;
-        free.params = req.params;
-        free.engram_alpha = req.engram_alpha;
-        free.tx = Some(req.tx);
-        free.want_logprobs = req.want_logprobs;
-        free.request_id = req.request_id;
-        free.cancelled = req.cancelled;
-        free.thinking = free.params.enable_thinking;
-        free.stats.prompt_tokens = free.prompt_tokens.len() as u32;
-        // Seed the recent_context with the prompt tail for engram lookups.
-        // We push the whole prompt so the first gen step's engram query
-        // has full context; Slot::push_context bounds the window to 256.
-        let prompt_tokens_clone = free.prompt_tokens.clone();
+        free.state = SlotState::Prefilling { chunks_done };
+        free.pos = prefill_skip as i32;
+
+        // Engram seed: push the FULL prompt regardless of hit/miss so
+        // the first gen step's n-gram query has identical context in
+        // warm and cold paths (M2 plan § 5).
         for t in prompt_tokens_clone {
             free.push_context(t);
         }
@@ -1705,6 +1943,25 @@ impl NativeDriver {
 
     /// Reap every Draining slot: emit exactly one Done frame, release KV
     /// pages for the seq_id, mark the slot Free.
+    ///
+    /// # M2-J2c — prompt-prefix cache insertion
+    ///
+    /// For each Draining slot, BEFORE `kv_cache_seq_rm_for`, this method
+    /// may snapshot the slot's KV/GDN state via
+    /// [`LlamaForward::save_seq_state`] and insert it into the trie,
+    /// keyed on the slot's full `prompt_tokens`. Rules:
+    ///
+    /// - Gated on `self.prefix_cache_enabled && self.prefix_trie.is_some()`.
+    /// - `finish_reason` must be one of `{stop, length, cancel}`. Reason
+    ///   `error` slots are NOT cached (KV is unreliable on error paths).
+    /// - `stats.generated_tokens > 0` (slot actually reached Generating).
+    /// - `prompt_tokens` non-empty.
+    /// - On non-empty `Ok(blob)`: acquire `trie.write()`, allocate
+    ///   `next_kv_id()`, wrap in `Arc<KVBlock>`, call `insert(...)`.
+    /// - On empty blob / `Err` / poisoned lock: log and skip (never panic).
+    ///
+    /// The save MUST run before `kv_cache_seq_rm_for` — reversing the
+    /// order captures an empty blob.
     fn reap_draining(&mut self) {
         // Collect ids first to avoid borrow conflicts with llama kv_cache call.
         let draining_ids: Vec<(u32, String)> = self
@@ -1727,6 +1984,99 @@ impl NativeDriver {
                     finish_reason: reason.clone(),
                 });
             }
+
+            // --------------------------------------------------------------
+            // M2-J2c — optionally snapshot KV + insert into prefix trie.
+            // Runs BEFORE `kv_cache_seq_rm_for` so the FFI blob is valid.
+            // --------------------------------------------------------------
+            if self.prefix_cache_enabled && self.prefix_trie.is_some() {
+                // Gate: only save for successful / natural terminations.
+                // Error-path KV is unreliable and must not poison the cache.
+                let cache_decision: Option<Vec<u32>> = {
+                    let slot = self.pool.get_mut(slot_id);
+                    match slot {
+                        Some(s) => {
+                            let reason_ok = matches!(
+                                reason.as_str(),
+                                "stop" | "length" | "cancel"
+                            );
+                            let generated_ok = s.stats.generated_tokens > 0;
+                            let prompt_ok = !s.prompt_tokens.is_empty();
+                            if reason_ok && generated_ok && prompt_ok {
+                                Some(s.prompt_tokens.clone())
+                            } else {
+                                if !reason_ok {
+                                    eprintln!(
+                                        "[prefix_cache] skip save slot={} reason={} \
+                                         (only stop/length/cancel cached)",
+                                        slot_id, reason,
+                                    );
+                                } else if !generated_ok {
+                                    eprintln!(
+                                        "[prefix_cache] skip save slot={} generated_tokens=0 \
+                                         (slot never reached Generating)",
+                                        slot_id,
+                                    );
+                                }
+                                None
+                            }
+                        }
+                        None => None,
+                    }
+                };
+
+                if let Some(prompt_tokens) = cache_decision {
+                    // FFI save (must precede kv_cache_seq_rm_for).
+                    match self.llama.save_seq_state(slot_id as i32) {
+                        Ok(blob) => {
+                            if blob.is_empty() {
+                                eprintln!(
+                                    "[prefix_cache] save_seq_state returned empty blob for \
+                                     slot={} (FFI says 0 bytes) — skipping insert",
+                                    slot_id,
+                                );
+                            } else if let Some(trie_arc) = self.prefix_trie.as_ref() {
+                                let bytes = blob.len();
+                                let n_toks = prompt_tokens.len();
+                                match trie_arc.write() {
+                                    Ok(mut g) => {
+                                        let kv_id = g.next_kv_id();
+                                        let block = std::sync::Arc::new(
+                                            crate::prefix_cache::KVBlock::new(
+                                                kv_id, blob, n_toks,
+                                            ),
+                                        );
+                                        let fresh = g.insert(&prompt_tokens, block);
+                                        let trie_len = g.len();
+                                        let cached_bytes = g.cached_bytes();
+                                        eprintln!(
+                                            "[prefix_cache] insert slot={} kv_id={} n_toks={} \
+                                             bytes={} fresh={} trie_len={} cached_bytes={}",
+                                            slot_id, kv_id, n_toks, bytes, fresh,
+                                            trie_len, cached_bytes,
+                                        );
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "[prefix_cache] trie RwLock poisoned on insert \
+                                             slot={}: {} — skipping",
+                                            slot_id, e,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[prefix_cache] save_seq_state failed for slot={}: {} \
+                                 — skipping insert",
+                                slot_id, e,
+                            );
+                        }
+                    }
+                }
+            }
+
             // Free KV/SSM state for this seq_id.
             let _ = self.llama.kv_cache_seq_rm_for(slot_id as i32);
             // Mark slot free (also clears sampler state + recent_context).
@@ -2064,5 +2414,46 @@ mod tests {
         // (would NaN-crash only if we dereferenced; we don't).
         assert_eq!(argmax_u32(&[]), 0);
         assert_eq!(argmax_u32(&[0.1, 0.2, 0.9, 0.3]), 2);
+    }
+
+    // ----------------------------------------------------------------
+    // M2-J2c — prefix-cache wiring invariants (unit, no FFI)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn m2_j2c_with_prefix_cache_none_is_inert() {
+        // Passing `None` must leave the scheduler in the M1 state —
+        // `prefix_trie = None`, `prefix_cache_enabled = false` — so
+        // the driver hot paths short-circuit without any RwLock touch.
+        let cfg = SchedulerConfig {
+            num_slots: 2, queue_cap: 4, enabled: true, native: true,
+        };
+        let sched = NativeScheduler::new(cfg, None, 0.0)
+            .unwrap()
+            .with_prefix_cache(None);
+        assert!(sched.prefix_trie.is_none());
+        assert!(!sched.prefix_cache_enabled);
+    }
+
+    #[test]
+    fn m2_j2c_with_prefix_cache_some_but_env_off_logs_and_disables() {
+        // Passing `Some(trie)` when CHIMERE_PREFIX_CACHE is NOT set
+        // (the default in tests) keeps the trie handle (so stats
+        // endpoint can still read it) but sets `prefix_cache_enabled`
+        // to false — the driver observes the gate and skips.
+        std::env::remove_var("CHIMERE_PREFIX_CACHE");
+        let cfg = SchedulerConfig {
+            num_slots: 2, queue_cap: 4, enabled: true, native: true,
+        };
+        let trie = std::sync::Arc::new(std::sync::RwLock::new(
+            crate::prefix_cache::PrefixTrie::new(16),
+        ));
+        let sched = NativeScheduler::new(cfg, None, 0.0)
+            .unwrap()
+            .with_prefix_cache(Some(trie));
+        assert!(sched.prefix_trie.is_some(),
+                "trie handle should be retained for stats readers");
+        assert!(!sched.prefix_cache_enabled,
+                "gate must be off when CHIMERE_PREFIX_CACHE unset");
     }
 }
