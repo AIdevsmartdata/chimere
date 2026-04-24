@@ -55,7 +55,7 @@
 //! - MTP re-enabled on a slot-exclusive basis.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use tokio::sync::{mpsc, Notify};
 
@@ -1115,6 +1115,11 @@ pub struct NativeScheduler {
     pub default_engram_alpha: f32,
     /// Flipped by `shutdown()`. Driver checks before each tick.
     pub shutdown: Arc<AtomicBool>,
+    /// Shared view of the driver's current active-slot count. Published by
+    /// the driver at the top of each tick (and on admit/reap), read by the
+    /// `/metrics` scrape and `/v1/status` handlers. `Relaxed` is sufficient
+    /// — observability gauge, eventual consistency is fine.
+    active_count: Arc<AtomicUsize>,
 }
 
 impl NativeScheduler {
@@ -1122,7 +1127,12 @@ impl NativeScheduler {
     pub fn slot_pool_size_or_default(&self) -> usize {
         self.config.num_slots
     }
-    pub fn slot_active_count_or_default(&self) -> usize { 0 }
+    /// Snapshot of the driver's current occupancy. Published on every tick
+    /// (see `NativeDriver::run`). Reads the shared `AtomicUsize`; never
+    /// blocks. Returns 0 before the driver has run its first tick.
+    pub fn slot_active_count_or_default(&self) -> usize {
+        self.active_count.load(Ordering::Relaxed)
+    }
     pub fn queue_depth_or_default(&self) -> usize { 0 }
 
     /// Build a native scheduler. The `LlamaForward` is NOT stored here —
@@ -1156,6 +1166,7 @@ impl NativeScheduler {
             engram_global,
             default_engram_alpha,
             shutdown: Arc::new(AtomicBool::new(false)),
+            active_count: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -1196,6 +1207,7 @@ impl NativeScheduler {
             "NativeScheduler::spawn_native_driver called twice".to_string()
         })?;
         let shutdown = Arc::clone(&self.shutdown);
+        let active_count = Arc::clone(&self.active_count);
         let num_slots = self.config.num_slots;
         let engram_global = self.engram_global.clone();
         let default_alpha = self.default_engram_alpha;
@@ -1245,6 +1257,7 @@ impl NativeScheduler {
                     shutdown,
                     max_prefill_chunk,
                     tick_us,
+                    active_count,
                 };
                 driver.run();
             })
@@ -1263,6 +1276,10 @@ struct NativeDriver {
     shutdown: Arc<AtomicBool>,
     max_prefill_chunk: usize,
     tick_us: u64,
+    /// Shared with `NativeScheduler::active_count`. Published each tick
+    /// so the `/metrics` scrape sees a live occupancy gauge rather than
+    /// a hardcoded zero.
+    active_count: Arc<AtomicUsize>,
 }
 
 impl NativeDriver {
@@ -1283,6 +1300,13 @@ impl NativeDriver {
             //    release KV pages, return slot to Free.
             self.reap_draining();
 
+            // Publish occupancy after admit/reap so `/metrics` sees the
+            // current number of slots serving a request. Relaxed is fine
+            // — this is a gauge sampled at scrape time. See also below,
+            // after seat_request, to cover the idle-wake path.
+            self.active_count
+                .store(self.pool.num_active(), Ordering::Relaxed);
+
             // 3) If no active slots, wait for one admission or shutdown.
             if self.pool.num_active() == 0 {
                 // Block on the next admission (up to 100 ms so shutdown can
@@ -1291,6 +1315,10 @@ impl NativeDriver {
                 match self.rx.try_recv() {
                     Ok(req) => {
                         self.seat_request(req);
+                        // Re-publish after seating so the first tick's
+                        // pre-forward phase already shows occupancy > 0.
+                        self.active_count
+                            .store(self.pool.num_active(), Ordering::Relaxed);
                     }
                     Err(mpsc::error::TryRecvError::Empty) => {
                         // No work. Short sleep to avoid 100% CPU spin.
@@ -1319,6 +1347,8 @@ impl NativeDriver {
                 std::thread::sleep(std::time::Duration::from_micros(self.tick_us));
             }
         }
+        // Clear the gauge so post-shutdown scrapes don't report stale occupancy.
+        self.active_count.store(0, Ordering::Relaxed);
         eprintln!("[slot_scheduler:native] driver exited (shutdown flag set)");
     }
 

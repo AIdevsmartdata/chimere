@@ -1455,8 +1455,13 @@ async fn chat_completions_stream(
                     st.metrics
                         .observe_ttft_ms(st.ttft_start.elapsed().as_millis() as u64);
                 }
-                // NOTE: we intentionally do NOT add_gen_tokens(1) for thinking
-                // — the metric tracks response tokens the client consumes.
+                // --- METRICS HOOK: count thinking tokens toward gen_tokens
+                // The client consumes these via the `reasoning_content`
+                // delta, and the non-streaming path includes them in
+                // `completion_tokens`. Keeping them out of gen_tokens_total
+                // made the counter read 0 for Qwen3 reasoning-heavy replies.
+                // Fixed 2026-04-24 (see native path for full context).
+                st.metrics.add_gen_tokens(1);
                 // Route thinking tokens to reasoning_content delta.
                 let chunk = ChatChunk {
                     id: st.req_id.clone(),
@@ -1718,6 +1723,17 @@ async fn chat_completions_native_stream(
                     st.metrics
                         .observe_ttft_ms(st.ttft_start.elapsed().as_millis() as u64);
                 }
+                // --- METRICS HOOK: count thinking tokens toward gen_tokens
+                // Thinking tokens ARE model-generated tokens that the client
+                // consumes (via `reasoning_content` delta), and the
+                // non-streaming path counts them in `completion_tokens`
+                // (see `run_inference` -> `gen.token_ids.len()`). Excluding
+                // them here made `chimere_gen_tokens_total` stay at 0 on
+                // Qwen3 reasoning-only replies (the model emits the full
+                // response inside a single `<think>` block before any
+                // content token, and short requests never leave thinking).
+                // Fixed 2026-04-24.
+                st.metrics.add_gen_tokens(1);
                 let chunk = ChatChunk {
                     id: st.req_id.clone(),
                     object: "chat.completion.chunk".into(),
