@@ -710,42 +710,54 @@ impl MultiEngramLookup {
     /// Frequencies from each table are summed per token, then normalised.
     /// Tables with more evidence for an n-gram naturally dominate.
     /// Returns `Vec<(token_id, probability)>` sorted descending.
+    ///
+    /// **Perf note (M1, 2026-04-24)**: this is the #1 profiler-identified
+    /// hot allocator on multi-slot native. Previous impl created a fresh
+    /// `HashMap` per call (per slot per tick). We now reuse a thread-local
+    /// scratch HashMap — scheduler's decoder thread calls this per slot, so
+    /// the thread-local correctly amortises across slots in one tick.
     pub fn lookup(&self, context: &[u32]) -> Vec<(u32, f32)> {
         if self.tables.len() == 1 {
             // Fast path: single table, no merge overhead
             return self.tables[0].1.lookup(context);
         }
 
-        // Merge: sum raw predictions across all tables
-        let mut merged: HashMap<u32, f32> = HashMap::new();
-        let mut any_hit = false;
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<HashMap<u32, f32>> =
+                std::cell::RefCell::new(HashMap::with_capacity(64));
+        }
 
-        for (_, table) in &self.tables {
-            let preds = table.lookup(context);
-            if !preds.is_empty() {
-                any_hit = true;
-                for (tok, prob) in preds {
-                    *merged.entry(tok).or_insert(0.0) += prob;
+        SCRATCH.with(|cell| {
+            let mut merged = cell.borrow_mut();
+            merged.clear();
+            let mut any_hit = false;
+
+            for (_, table) in &self.tables {
+                let preds = table.lookup(context);
+                if !preds.is_empty() {
+                    any_hit = true;
+                    for (tok, prob) in preds {
+                        *merged.entry(tok).or_insert(0.0) += prob;
+                    }
                 }
             }
-        }
 
-        if !any_hit {
-            return Vec::new();
-        }
+            if !any_hit {
+                return Vec::new();
+            }
 
-        // Re-normalise
-        let total: f32 = merged.values().sum();
-        if total <= 0.0 {
-            return Vec::new();
-        }
+            let total: f32 = merged.values().sum();
+            if total <= 0.0 {
+                return Vec::new();
+            }
 
-        let mut result: Vec<(u32, f32)> = merged
-            .into_iter()
-            .map(|(tok, freq)| (tok, freq / total))
-            .collect();
-        result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        result
+            let mut result: Vec<(u32, f32)> = merged
+                .iter()
+                .map(|(tok, freq)| (*tok, *freq / total))
+                .collect();
+            result.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            result
+        })
     }
 
     /// Draft tokens using the merged lookup (DART-style).
