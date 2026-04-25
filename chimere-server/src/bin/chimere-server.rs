@@ -33,6 +33,9 @@
 //! | `CHIMERE_NATIVE_ENGRAM_ALPHA` | `0.0`                                                       | Default engram bias alpha used by NativeScheduler when request does not override |
 //! | `CHIMERE_MAX_PREFILL_CHUNK` | `256`                                                          | Native scheduler: max prompt tokens per `forward_multi_seq` prefill tick (alias of `CHIMERE_NATIVE_MAX_PREFILL_CHUNK`) |
 //! | `CHIMERE_SKIP_LEGACY_LLAMA` | (unset)                                                       | Set to `1` to skip the legacy `Qwen35Model::init_llama_forward` when NativeScheduler is armed (saves ~KV cache VRAM) |
+//! | `CHIMERE_PREFIX_CACHE`       | `0`                                                         | M2-J2: master kill-switch for the prompt-prefix cache. `0` -> bit-identical to M1. `1` -> lookup on admission, snapshot on reap (2-5x faster prefill on warm system prompts). |
+//! | `CHIMERE_PREFIX_CACHE_MAX_BYTES` | `1073741824` (1 GB)                                      | Soft upper bound on total cached KV blob bytes; LRU-evicted on insert. |
+//! | `CHIMERE_PREFIX_CACHE_MAX_NODES` | `256`                                                    | Upper bound on the number of cache entries (independent of bytes). |
 //!
 //! # Observability
 //!
@@ -461,7 +464,38 @@ async fn main() {
             .and_then(|s| s.trim().parse().ok())
             .unwrap_or(0.0);
 
-        // 4. Construct the scheduler and spawn its driver.
+        // 4. M2-J2d -- optionally build the prompt-prefix cache trie.
+        //    Gated on `CacheConfig::from_env().enabled` (i.e.
+        //    `CHIMERE_PREFIX_CACHE=1` with non-zero budgets). When off,
+        //    we pass `None` and the scheduler's hot paths stay bit-
+        //    identical to M1 (no trie touch, no FFI save/restore).
+        //
+        //    Expected speedup on warm system-prompt repeats: 2-5x on
+        //    TTFT. See README.md in `~/Bureau/chimere-drafts/m2-j2-main-wire/`.
+        let prefix_cache_cfg = chimere_deltanet::prefix_cache::CacheConfig::from_env();
+        let prefix_trie: Option<Arc<std::sync::RwLock<chimere_deltanet::prefix_cache::PrefixTrie>>> =
+            if prefix_cache_cfg.enabled {
+                eprintln!(
+                    "[chimere-server] M2-J2 prompt-prefix cache ENABLED: \
+                     max_bytes={} ({:.2} GB), max_nodes={}. \
+                     Bypass with CHIMERE_PREFIX_CACHE=0.",
+                    prefix_cache_cfg.max_bytes,
+                    prefix_cache_cfg.max_bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+                    prefix_cache_cfg.max_nodes,
+                );
+                let trie = chimere_deltanet::prefix_cache::PrefixTrie::from_config(
+                    &prefix_cache_cfg,
+                );
+                Some(Arc::new(std::sync::RwLock::new(trie)))
+            } else {
+                eprintln!(
+                    "[chimere-server] M2-J2 prompt-prefix cache DISABLED \
+                     (CHIMERE_PREFIX_CACHE unset or =0) -- bit-identical to M1"
+                );
+                None
+            };
+
+        // 5. Construct the scheduler and spawn its driver.
         let mut native_sched = match NativeScheduler::new(
             scheduler_cfg.clone(),
             engram_global,
@@ -476,6 +510,11 @@ async fn main() {
                 std::process::exit(1);
             }
         };
+
+        // Attach the prefix-cache trie before spawning the driver. When
+        // `prefix_trie == None` (CHIMERE_PREFIX_CACHE=0), this is a no-op
+        // that leaves the scheduler in the M1 bit-identical configuration.
+        native_sched = native_sched.with_prefix_cache(prefix_trie);
 
         // Spawn the driver BEFORE wrapping in Arc — spawn_native_driver
         // requires `&mut self` to consume the admission_rx end.
