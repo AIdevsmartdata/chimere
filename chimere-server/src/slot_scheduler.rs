@@ -1897,6 +1897,60 @@ impl NativeDriver {
             })
             .collect();
 
+        // BISECTION 2026-04-26: env gate to test if multi-seq batch is the bug.
+        // CHIMERE_SEQUENTIAL_DECODE=1 → fan-out to N sequential forwards (one per slot)
+        // instead of one packed multi-seq decode. If this stabilises M>=3 + heterogeneous,
+        // the bug is confirmed inside ik_llama's llama_decode multi-seq path.
+        static SEQUENTIAL_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let sequential = *SEQUENTIAL_DECODE.get_or_init(|| {
+            std::env::var("CHIMERE_SEQUENTIAL_DECODE")
+                .map(|s| s == "1" || s.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        });
+
+        if sequential {
+            // Slow path: N independent llama_decode calls, one per slot.
+            // Mirrors what the J2 closure scheduler does. batch_idx is always 0.
+            for (slot_id, tok_in, pos) in gen_inputs {
+                let single = vec![crate::llama_backend::MultiSeqEntry {
+                    token: tok_in,
+                    pos,
+                    seq_id: slot_id as i32,
+                    request_logits: true,
+                }];
+                let _ = crate::prof!("ffi.forward_multi_seq.seq", {
+                    self.llama.forward_multi_seq(&single)?
+                });
+                if let Some(slot) = self.pool.get_mut(slot_id) {
+                    slot.apply_engram_bias_to_sampler();
+                }
+                let sampler_raw = self
+                    .pool
+                    .get_mut(slot_id)
+                    .and_then(|s| s.sampler.as_ref().map(|h| unsafe { h.as_raw() }));
+                let (tok, _lp) = match sampler_raw {
+                    Some(raw) if !raw.is_null() => unsafe {
+                        self.llama.sample_slot_with_logprobs(raw, 0)
+                    },
+                    _ => {
+                        let raw = self.llama.get_logits_at(0).ok_or_else(|| {
+                            "null logits in sequential fallback".to_string()
+                        })?;
+                        (argmax_u32(raw), Vec::new())
+                    }
+                };
+                self.emit_sampled_token(slot_id, tok);
+                if let Some(slot) = self.pool.get_mut(slot_id) {
+                    if matches!(slot.state, SlotState::Draining) { continue; }
+                    slot.pos += 1;
+                    if slot.stats.generated_tokens >= slot.params.max_tokens {
+                        slot.mark_draining("length");
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         let _out = crate::prof!("ffi.forward_multi_seq", { self.llama.forward_multi_seq(&entries)? });
 
         // Per-slot apply_bias → sample → emit. Batch index matches input order.
