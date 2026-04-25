@@ -1192,6 +1192,60 @@ impl LlamaForward {
     /// Set position counter (for agent context restore).
     pub fn set_pos(&mut self, pos: i32) { self.pos = pos; }
 
+    // ---------- M2-J2b — prefix-cache FFI aliases ----------
+    //
+    // The underlying `state_seq_save` / `state_seq_restore` already exist
+    // for multi-agent switching (see `agent_scheduler.rs`). M2 reuses them
+    // for prompt-prefix caching, exposed here under scheduler-friendly
+    // names so call sites in `slot_scheduler::NativeDriver` read as
+    // "cache save/restore" rather than "agent save/restore". Behaviour is
+    // bit-identical; the distinct names keep a rename-free path to the
+    // existing `agent_scheduler.rs` consumers.
+
+    /// Save the KV cache + GDN recurrent state for `seq_id` as an opaque
+    /// blob. Returns `Err` on FFI failure. A zero-byte seq (no tokens
+    /// decoded) returns `Ok(vec![])`.
+    ///
+    /// Used by `NativeDriver::reap_draining` (M2-J2c) to snapshot a slot's
+    /// cache before freeing it, so the trie can retain the prefix for the
+    /// next request that shares it.
+    ///
+    /// # Blob format
+    ///
+    /// The returned bytes are ik_llama-internal: per-layer KV pages,
+    /// GDN recurrent matrices, and sampler position markers. The blob
+    /// is **seq_id-independent** — a blob saved from `seq_id=0` restores
+    /// cleanly into any other slot's `seq_id` (verified by the agent
+    /// switcher since Mar 2026).
+    pub fn save_seq_state(&self, seq_id: i32) -> Result<Vec<u8>, String> {
+        self.state_seq_save(seq_id)
+    }
+
+    /// Restore a previously saved blob into `seq_id`. Caller MUST also
+    /// call [`set_pos`](Self::set_pos) with the token count covered by
+    /// the blob (i.e. `KVBlock::token_count`) so the Rust-side position
+    /// counter agrees with the restored KV extent.
+    ///
+    /// Canonical restore pattern (copied from `agent_scheduler.rs:189`):
+    ///
+    /// ```ignore
+    /// llama.restore_seq_state(slot_seq_id, &block.seq_bytes)?;
+    /// llama.set_pos(block.token_count as i32);
+    /// ```
+    ///
+    /// The scheduler MUST also replay `tokens[..block.token_count]`
+    /// through `Slot::push_context` to rebuild the engram n-gram
+    /// history — see plan-M2-prefix-cache.md § 5.
+    pub fn restore_seq_state(&mut self, seq_id: i32, blob: &[u8]) -> Result<(), String> {
+        self.state_seq_restore(seq_id, blob)
+    }
+
+    /// Read the Rust-side position counter. `NativeDriver` does NOT use
+    /// this accessor (it tracks per-slot positions via `Slot.pos`), but
+    /// the single-slot path (`AppStateModel`) occasionally introspects it
+    /// for diagnostics, and M2 consumers may find it useful for asserts.
+    pub fn current_pos(&self) -> i32 { self.pos }
+
     pub fn reset(&mut self) {
         unsafe {
             llama_kv_cache_clear(self.ctx);
