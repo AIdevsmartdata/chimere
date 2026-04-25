@@ -1152,6 +1152,46 @@ impl NativeScheduler {
     }
     pub fn queue_depth_or_default(&self) -> usize { 0 }
 
+    /// M2-J6 — JSON snapshot of the prefix-cache state for `/v1/prefix_cache_stats`.
+    /// Never blocks the driver: uses `try_read` on the trie's `RwLock` and
+    /// returns `{busy: true}` if currently write-locked.
+    pub fn prefix_cache_stats_json(&self) -> serde_json::Value {
+        let Some(trie_arc) = self.prefix_trie.as_ref() else {
+            return serde_json::json!({
+                "enabled": false,
+                "reason": "prefix_trie absent (CHIMERE_PREFIX_CACHE=0 or unset)"
+            });
+        };
+        if !self.prefix_cache_enabled {
+            return serde_json::json!({
+                "enabled": false,
+                "reason": "kill switch (prefix_cache_enabled=false)"
+            });
+        }
+        match trie_arc.try_read() {
+            Ok(trie) => {
+                let snap = trie.stats.snapshot();
+                serde_json::json!({
+                    "enabled": true,
+                    "len": trie.len(),
+                    "cached_bytes": trie.cached_bytes(),
+                    "hits": snap.hits,
+                    "misses": snap.misses,
+                    "evictions": snap.evictions,
+                    "total_hit_tokens": snap.total_hit_tokens,
+                    "total_query_tokens": snap.total_query_tokens,
+                    "hit_rate": snap.hit_rate(),
+                    "avg_hit_tokens": snap.avg_hit_tokens(),
+                })
+            }
+            Err(_) => serde_json::json!({
+                "enabled": true,
+                "busy": true,
+                "reason": "trie write-locked, retry"
+            }),
+        }
+    }
+
     /// Build a native scheduler. The `LlamaForward` is NOT stored here —
     /// it is passed to `spawn_native_driver` which moves it into the
     /// dedicated driver thread.

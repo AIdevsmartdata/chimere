@@ -1948,6 +1948,23 @@ async fn profile_reset() -> impl IntoResponse {
     StatusCode::NO_CONTENT
 }
 
+/// GET /v1/prefix_cache_stats — JSON snapshot of the M2 prefix cache.
+///
+/// Returns `{enabled: false, reason: ...}` when the cache is off (env gate
+/// or kill switch). When on, returns hits/misses/evictions/hit_rate plus
+/// trie length and cached bytes. Non-blocking (uses `try_read` on the trie
+/// `RwLock`); returns `{busy: true}` if write-locked at request time.
+async fn prefix_cache_stats_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let body = match state.native_scheduler.as_ref() {
+        Some(sched) => sched.prefix_cache_stats_json(),
+        None => serde_json::json!({
+            "enabled": false,
+            "reason": "native scheduler not active (CHIMERE_MULTISLOT_NATIVE != 1)"
+        }),
+    };
+    Json(body)
+}
+
 // ---------------------------------------------------------------------------
 // Router factory
 // ---------------------------------------------------------------------------
@@ -1961,5 +1978,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/v1/status", get(status_handler))
         .route("/v1/profile", get(profile_report))
         .route("/v1/profile/reset", post(profile_reset))
+        .route("/v1/prefix_cache_stats", get(prefix_cache_stats_handler))
         .with_state(state)
 }
