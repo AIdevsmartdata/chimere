@@ -577,6 +577,7 @@ async fn main() {
     eprintln!("  GET  http://{}/health", addr);
     eprintln!("  GET  http://{}/metrics", addr);
     eprintln!("  GET  http://{}/v1/status", addr);
+    eprintln!("  GET  http://{}/v1/prefix_cache_stats", addr);
 
     let listener = match TcpListener::bind(&addr).await {
         Ok(l) => l,
