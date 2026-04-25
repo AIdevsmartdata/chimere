@@ -1,12 +1,11 @@
-//! # M2 J1 — Prefix Cache (PoC: pure-Rust radix trie over token IDs)
+//! # M2 — Prefix Cache (J1 PoC + J2 CacheConfig env-reader)
 //!
-//! Draft scaffolding for the M2 prefix-cache epic. This module provides a
-//! token-keyed radix trie that eventually stores references to saved KV
-//! cache blocks; for J1 we ship the data structure, LRU eviction, and unit
-//! tests. The ik_llama FFI wiring (`llama_state_seq_get_size/data/set_data`)
-//! lands in M2 J3.
+//! J1 scaffolding (radix trie + LRU + stats + 11 unit tests) is unchanged
+//! from `m2-prefix-cache` tip `64e4680`. J2 adds a `CacheConfig` env-reader
+//! so the scheduler can gate the whole feature behind `CHIMERE_PREFIX_CACHE`
+//! and respect a bounded byte budget via `CHIMERE_PREFIX_CACHE_MAX_BYTES`.
 //!
-//! ## Design summary
+//! ## Design summary (J1, preserved)
 //!
 //! - Keys are `&[u32]` token IDs (the exact sequence produced by the
 //!   tokenizer on the request's `messages`). Since Qwen3.5's vocabulary is
@@ -19,11 +18,22 @@
 //! - LRU is tracked per-entry: `last_hit` is updated on every successful
 //!   `longest_prefix()` or `insert()` and used by `evict_lru()`.
 //!
-//! ## Not in scope for this file
+//! ## J2 additions
 //!
-//! - Actual serialization of KV via ik_llama FFI (M2 J3).
-//! - Wiring into `slot_scheduler::ScheduledRequest` admission (M2 J4).
-//! - Engram compatibility checks (documented in `plan-M2-prefix-cache.md`).
+//! - [`CacheConfig::from_env`] — reads `CHIMERE_PREFIX_CACHE`,
+//!   `CHIMERE_PREFIX_CACHE_MAX_BYTES`, `CHIMERE_PREFIX_CACHE_MAX_NODES`.
+//! - [`PrefixTrie::from_config`] — thin constructor that applies a
+//!   `CacheConfig`; equivalent to `with_byte_budget` when enabled, `None`
+//!   caller-side when disabled.
+//!
+//! ## Not in scope here
+//!
+//! - Actual FFI serialisation of KV (lives in `llama_backend.rs` aliases
+//!   `save_seq_state` / `restore_seq_state` — M2-J2).
+//! - Wiring into `slot_scheduler::NativeDriver` admission (M2-J2 — patches
+//!   in `APPLY.md`).
+//! - Engram compatibility (doc in the M2 plan; `Slot::push_context` loop
+//!   is inside the scheduler patch, not here).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,22 +41,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
-// KV block placeholder — filled by M2 J3
+// KV block placeholder — byte-level handle for J2 FFI wiring
 // ---------------------------------------------------------------------------
 
 /// Opaque handle to a serialized KV cache block.
 ///
-/// For J1 this is a placeholder holding raw bytes (as produced by
-/// `LlamaForward::state_seq_save`). In M2 J3 this grows a `token_count`
-/// field and may eventually back onto CPU-pinned memory to keep VRAM free.
+/// In J1 this was a pure PoC; in J2 the scheduler populates `seq_bytes`
+/// via `LlamaForward::save_seq_state` and consumes it via
+/// `LlamaForward::restore_seq_state`. The rest of the shape is unchanged
+/// so the J1 tests still apply verbatim.
 ///
 /// `KVBlock` is immutable once inserted. Sharing is cheap via `Arc`.
 #[derive(Debug)]
 pub struct KVBlock {
     /// Opaque ID for logging / stats correlation.
     pub id: u32,
-    /// Serialized bytes from `llama_state_seq_get_data`. In J1 this is
-    /// whatever the caller passed in; J3 wires it to real serialization.
+    /// Serialized bytes from `llama_state_seq_get_data`.
     pub seq_bytes: Vec<u8>,
     /// Number of tokens this block represents (the "prefix length" it
     /// covers). Needed so the scheduler can compute `n_hit = tokens[..n]`
@@ -66,7 +76,120 @@ impl KVBlock {
 }
 
 // ---------------------------------------------------------------------------
-// Cache statistics
+// M2-J2 — CacheConfig (env reader + kill switch)
+// ---------------------------------------------------------------------------
+
+/// Default maximum cached bytes when unset: 1 GB (per mission spec).
+pub const DEFAULT_MAX_CACHED_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Default maximum trie nodes when unset.
+pub const DEFAULT_MAX_NODES: usize = 256;
+
+/// Runtime configuration for the prefix cache, read once at scheduler
+/// construction time. Changes require a process restart — env vars are
+/// not polled.
+///
+/// ## Env vars
+///
+/// | Var | Type | Default | Meaning |
+/// |---|---|---|---|
+/// | `CHIMERE_PREFIX_CACHE` | `bool` (0/1/true/false/on/off, case-insensitive) | `0` | Master kill-switch. When **off**, the scheduler behaves bit-identically to M1 — no trie touch, no FFI save/restore. |
+/// | `CHIMERE_PREFIX_CACHE_MAX_BYTES` | `usize` | `1_073_741_824` (1 GB) | Soft upper bound on sum of `KVBlock::byte_size()`. The trie enforces this via LRU eviction at insert time. |
+/// | `CHIMERE_PREFIX_CACHE_MAX_NODES` | `usize` | `256` | Upper bound on the number of value-bearing entries (independent of bytes). |
+///
+/// ## Precedence
+///
+/// If the kill-switch is off, the other two vars are still *parsed* (so
+/// malformed values produce a clear error at startup) but the cache is
+/// not built. The scheduler's `prefix_trie: None` short-circuits every
+/// hot-path.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheConfig {
+    pub enabled: bool,
+    pub max_bytes: usize,
+    pub max_nodes: usize,
+}
+
+impl CacheConfig {
+    /// Read all three env vars. Never panics — malformed integers fall
+    /// back to the defaults with an eprintln warning.
+    pub fn from_env() -> Self {
+        let enabled = std::env::var("CHIMERE_PREFIX_CACHE")
+            .map(|v| parse_bool_env(&v))
+            .unwrap_or(false);
+
+        let max_bytes = std::env::var("CHIMERE_PREFIX_CACHE_MAX_BYTES")
+            .ok()
+            .and_then(|v| {
+                v.trim().parse::<usize>().map_err(|e| {
+                    eprintln!(
+                        "[prefix_cache] CHIMERE_PREFIX_CACHE_MAX_BYTES parse error: {} \
+                         (falling back to {} B)",
+                        e, DEFAULT_MAX_CACHED_BYTES,
+                    );
+                    e
+                }).ok()
+            })
+            .unwrap_or(DEFAULT_MAX_CACHED_BYTES);
+
+        let max_nodes = std::env::var("CHIMERE_PREFIX_CACHE_MAX_NODES")
+            .ok()
+            .and_then(|v| {
+                v.trim().parse::<usize>().map_err(|e| {
+                    eprintln!(
+                        "[prefix_cache] CHIMERE_PREFIX_CACHE_MAX_NODES parse error: {} \
+                         (falling back to {})",
+                        e, DEFAULT_MAX_NODES,
+                    );
+                    e
+                }).ok()
+            })
+            .unwrap_or(DEFAULT_MAX_NODES);
+
+        // Zero budgets force the cache off even if the kill-switch is on.
+        let effectively_enabled = enabled && max_bytes > 0 && max_nodes > 0;
+        if enabled && !effectively_enabled {
+            eprintln!(
+                "[prefix_cache] CHIMERE_PREFIX_CACHE=1 but max_bytes={} max_nodes={} → \
+                 treating as disabled",
+                max_bytes, max_nodes,
+            );
+        }
+
+        Self {
+            enabled: effectively_enabled,
+            max_bytes,
+            max_nodes,
+        }
+    }
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_bytes: DEFAULT_MAX_CACHED_BYTES,
+            max_nodes: DEFAULT_MAX_NODES,
+        }
+    }
+}
+
+/// Canonical boolean parser used by several env vars in this repo.
+/// Accepts `"1"`, `"true"`, `"yes"`, `"on"` (case-insensitive) as true;
+/// everything else (including empty string) as false.
+fn parse_bool_env(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    t == "1"
+        || t.eq_ignore_ascii_case("true")
+        || t.eq_ignore_ascii_case("yes")
+        || t.eq_ignore_ascii_case("on")
+}
+
+// ---------------------------------------------------------------------------
+// Cache statistics (J1 — unchanged)
 // ---------------------------------------------------------------------------
 
 /// Cumulative counters for `/v1/prefix_cache_stats`. Use atomics so the
@@ -130,7 +253,7 @@ impl CacheStatsSnapshot {
 }
 
 // ---------------------------------------------------------------------------
-// Trie node
+// Trie node (J1 — unchanged)
 // ---------------------------------------------------------------------------
 
 /// A PATRICIA-style trie node. The edge from parent→self is `edge_label`;
@@ -168,7 +291,7 @@ impl TrieNode {
 }
 
 // ---------------------------------------------------------------------------
-// PrefixTrie
+// PrefixTrie (J1 API preserved; J2 adds from_config + byte-budget eviction on insert)
 // ---------------------------------------------------------------------------
 
 /// Token-keyed radix trie storing references to saved KV blocks.
@@ -180,11 +303,10 @@ impl TrieNode {
 pub struct PrefixTrie {
     root: TrieNode,
     /// Upper bound on the number of value-bearing entries. Exceeding this
-    /// triggers LRU eviction. Not the same as VRAM/CPU byte budget — that's
-    /// tracked separately in `max_cached_bytes`.
+    /// triggers LRU eviction.
     max_nodes: usize,
     /// Soft byte budget for the serialized KV data (sum of `byte_size()`).
-    /// 0 → no byte bound. M2 J5 tunes this.
+    /// 0 → no byte bound.
     max_cached_bytes: usize,
     pub stats: CacheStats,
     next_block_id: u32,
@@ -207,6 +329,13 @@ impl PrefixTrie {
         t
     }
 
+    /// M2-J2 — construct a `PrefixTrie` sized per the `CacheConfig`. The
+    /// caller is responsible for not calling this when `cfg.enabled` is
+    /// false (the scheduler just wires `prefix_trie: None` in that case).
+    pub fn from_config(cfg: &CacheConfig) -> Self {
+        Self::with_byte_budget(cfg.max_nodes, cfg.max_bytes)
+    }
+
     /// Number of value-bearing entries currently in the trie.
     pub fn len(&self) -> usize {
         self.root.count_values()
@@ -217,12 +346,20 @@ impl PrefixTrie {
     /// Insert `tokens → kv_handle`. Returns `true` if this is a fresh entry,
     /// `false` if it replaced an existing value at the same prefix.
     ///
-    /// After insertion, if `len() > max_nodes` we evict the single oldest
-    /// entry. M2 J5 may tune this to batched eviction.
+    /// After insertion, evicts LRU entries until both `len() <= max_nodes`
+    /// AND `cached_bytes() <= max_cached_bytes` (when the byte budget is
+    /// non-zero).
     pub fn insert(&mut self, tokens: &[u32], kv_handle: Arc<KVBlock>) -> bool {
         let fresh = Self::insert_rec(&mut self.root, tokens, kv_handle);
+        // Node-count bound.
         while self.len() > self.max_nodes {
-            self.evict_one();
+            if !self.evict_one() { break; }
+        }
+        // Byte-count bound (M2-J2). Only active when max_cached_bytes > 0.
+        if self.max_cached_bytes > 0 {
+            while self.cached_bytes() > self.max_cached_bytes {
+                if !self.evict_one() { break; }
+            }
         }
         fresh
     }
@@ -237,40 +374,30 @@ impl PrefixTrie {
 
         let first = tokens[0];
         if let Some(child) = node.children.get_mut(&first) {
-            // Compute the longest common prefix between `tokens` and the
-            // child's edge label.
             let common = common_prefix_len(tokens, &child.edge_label);
             if common == child.edge_label.len() {
-                // Full edge consumed — descend.
                 return Self::insert_rec(child, &tokens[common..], kv);
             }
             // Partial match → split the edge at `common`.
-            // 1. Take child out so we can rewrite it.
             let mut old_child = node.children.remove(&first).unwrap();
             let split_label: Vec<u32> = old_child.edge_label[common..].to_vec();
             old_child.edge_label = split_label.clone();
 
-            // 2. New intermediate node holds tokens[..common] as its edge.
             let mut intermediate = TrieNode::new(tokens[..common].to_vec());
             intermediate.last_hit = Instant::now();
 
-            // 3. Reparent old child under intermediate, keyed by its new first token.
             if !split_label.is_empty() {
                 intermediate.children.insert(split_label[0], old_child);
             } else {
-                // Shouldn't happen (we took common < full-edge path), but defensive.
                 intermediate.value = old_child.value.take();
             }
 
-            // 4. Insert remainder of the new path into intermediate.
             let remainder = &tokens[common..];
             let fresh = Self::insert_rec(&mut intermediate, remainder, kv);
 
-            // 5. Reattach under node.
             node.children.insert(first, intermediate);
             fresh
         } else {
-            // No child with this first token — create a fresh branch.
             let mut fresh_node = TrieNode::new(tokens.to_vec());
             fresh_node.last_hit = Instant::now();
             fresh_node.value = Some(kv);
@@ -300,19 +427,16 @@ impl PrefixTrie {
         tokens: &[u32],
         depth: usize,
     ) -> Option<(usize, Arc<KVBlock>)> {
-        // Best match found so far: starts as `node`'s value if present.
         let mut best: Option<(usize, Arc<KVBlock>)> = node.value.as_ref()
             .map(|kv| (depth, Arc::clone(kv)));
         if best.is_some() {
             node.last_hit = Instant::now();
         }
 
-        // Try to descend further.
         if let Some(first) = tokens.first().copied() {
             if let Some(child) = node.children.get_mut(&first) {
                 let common = common_prefix_len(tokens, &child.edge_label);
                 if common == child.edge_label.len() {
-                    // Full edge consumed — recurse.
                     let child_depth = depth + common;
                     if let Some(deeper) =
                         Self::longest_prefix_rec(child, &tokens[common..], child_depth)
@@ -320,9 +444,8 @@ impl PrefixTrie {
                         return Some(deeper);
                     }
                 }
-                // Partial edge match (common < edge.len()): the child node
-                // has no value exposed at a partial position, so `best`
-                // from above is our answer.
+                // Partial edge match: `best` from above is the answer.
+                // (Falls through to the return below.)
             }
         }
         best
@@ -342,12 +465,8 @@ impl PrefixTrie {
 
     /// Evict the single oldest entry. Returns `false` if the trie is empty.
     fn evict_one(&mut self) -> bool {
-        // Walk to find the value-bearing node with oldest last_hit. We do
-        // this as a two-pass algorithm (find path, then clear value) to
-        // avoid holding a &mut across the descent.
         let victim_path = self.find_lru_path();
         let Some(path) = victim_path else { return false };
-        // Clear the value at the victim path.
         let cleared = Self::clear_value_at(&mut self.root, &path);
         if cleared {
             self.stats.record_eviction(1);
@@ -394,7 +513,7 @@ impl PrefixTrie {
 
     /// Allocate the next KVBlock ID. Used by callers that construct
     /// `KVBlock` instances (typically the scheduler after a successful
-    /// prefill → `state_seq_save`).
+    /// prefill → `save_seq_state`).
     pub fn next_kv_id(&mut self) -> u32 {
         let id = self.next_block_id;
         self.next_block_id = self.next_block_id.wrapping_add(1);
@@ -419,7 +538,7 @@ fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Tests — J1 set (11 tests) + J2 additions (CacheConfig + byte-budget eviction)
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -428,6 +547,10 @@ mod tests {
 
     fn mk_block(id: u32, n_tokens: usize) -> Arc<KVBlock> {
         Arc::new(KVBlock::new(id, vec![0u8; n_tokens * 128], n_tokens))
+    }
+
+    fn mk_block_bytes(id: u32, n_bytes: usize) -> Arc<KVBlock> {
+        Arc::new(KVBlock::new(id, vec![0u8; n_bytes], n_bytes / 128))
     }
 
     #[test]
@@ -455,11 +578,6 @@ mod tests {
 
     #[test]
     fn shared_prefix_returns_longest() {
-        // Three prompts sharing the prefix [1,2,3]:
-        //   P1 = [1,2,3]              (len=3)
-        //   P2 = [1,2,3,4,5]          (len=5)
-        //   P3 = [1,2,3,4,5,6,7,8]    (len=8)
-        // Querying [1,2,3,4,5,6,7,8,9] must return the len-8 match.
         let mut t = PrefixTrie::new(16);
         t.insert(&[1, 2, 3], mk_block(1, 3));
         t.insert(&[1, 2, 3, 4, 5], mk_block(2, 5));
@@ -474,16 +592,11 @@ mod tests {
 
     #[test]
     fn partial_prefix_match_returns_shortest_valid() {
-        // Insert [1,2,3,4,5] only. Query [1,2,3,9,9] should match [1,2,3]
-        // IF we had [1,2,3] stored — but we don't, so return None (no
-        // value on partial edges).
         let mut t = PrefixTrie::new(16);
         t.insert(&[1, 2, 3, 4, 5], mk_block(1, 5));
-        // Query that diverges mid-edge.
         let hit = t.longest_prefix(&[1, 2, 3, 9, 9]);
         assert!(hit.is_none(), "partial edge should not count as a hit");
 
-        // Now also add [1,2,3]. Same query should hit len=3.
         t.insert(&[1, 2, 3], mk_block(2, 3));
         let (n_hit, kv) = t.longest_prefix(&[1, 2, 3, 9, 9]).unwrap();
         assert_eq!(n_hit, 3);
@@ -505,12 +618,9 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         t.insert(&[4, 5, 6], mk_block(2, 3));
         std::thread::sleep(std::time::Duration::from_millis(5));
-        // At len=2; inserting a 3rd should evict the oldest (id=1).
         t.insert(&[7, 8, 9], mk_block(3, 3));
         assert_eq!(t.len(), 2, "LRU eviction should cap at max_nodes");
-        // The oldest path [1,2,3] should be gone.
         assert!(t.longest_prefix(&[1, 2, 3]).is_none());
-        // Newer paths must survive.
         assert!(t.longest_prefix(&[4, 5, 6]).is_some());
         assert!(t.longest_prefix(&[7, 8, 9]).is_some());
 
@@ -525,11 +635,8 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(5));
         t.insert(&[4, 5, 6], mk_block(2, 3));
         std::thread::sleep(std::time::Duration::from_millis(5));
-        // Refresh the older entry by querying it.
         let _ = t.longest_prefix(&[1, 2, 3]);
         std::thread::sleep(std::time::Duration::from_millis(5));
-        // Now insert a 3rd — the LRU should be [4,5,6] (which we did not
-        // touch), not [1,2,3] (which we refreshed).
         t.insert(&[7, 8, 9], mk_block(3, 3));
         assert_eq!(t.len(), 2);
         assert!(t.longest_prefix(&[1, 2, 3]).is_some(),
@@ -553,8 +660,6 @@ mod tests {
 
     #[test]
     fn edge_split_preserves_existing_entries() {
-        // Insert [1,2,3,4,5], then [1,2,3]. The trie must split the edge
-        // and keep BOTH entries discoverable.
         let mut t = PrefixTrie::new(16);
         t.insert(&[1, 2, 3, 4, 5], mk_block(1, 5));
         t.insert(&[1, 2, 3], mk_block(2, 3));
@@ -574,9 +679,9 @@ mod tests {
         let mut t = PrefixTrie::new(16);
         t.insert(&[1, 2, 3], mk_block(1, 3));
 
-        let _ = t.longest_prefix(&[1, 2, 3]);   // hit, 3 tokens
-        let _ = t.longest_prefix(&[1, 2, 3, 4]); // hit, 3 tokens
-        let _ = t.longest_prefix(&[99, 99]);     // miss
+        let _ = t.longest_prefix(&[1, 2, 3]);
+        let _ = t.longest_prefix(&[1, 2, 3, 4]);
+        let _ = t.longest_prefix(&[99, 99]);
 
         let s = t.stats.snapshot();
         assert_eq!(s.hits, 2);
@@ -589,8 +694,8 @@ mod tests {
     #[test]
     fn cached_bytes_sums_all_blocks() {
         let mut t = PrefixTrie::new(16);
-        t.insert(&[1, 2, 3], mk_block(1, 3));       // 3 * 128 = 384
-        t.insert(&[4, 5, 6, 7, 8], mk_block(2, 5));  // 5 * 128 = 640
+        t.insert(&[1, 2, 3], mk_block(1, 3));
+        t.insert(&[4, 5, 6, 7, 8], mk_block(2, 5));
         assert_eq!(t.cached_bytes(), 384 + 640);
     }
 
@@ -609,5 +714,62 @@ mod tests {
         assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 2, 9]), 2);
         assert_eq!(common_prefix_len(&[1, 2, 3], &[9]), 0);
         assert_eq!(common_prefix_len(&[], &[1]), 0);
+    }
+
+    // ----------------------------------------------------------------
+    // M2-J2 — CacheConfig + byte-budget eviction
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn cache_config_default_is_disabled() {
+        let cfg = CacheConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.max_bytes, DEFAULT_MAX_CACHED_BYTES);
+        assert_eq!(cfg.max_nodes, DEFAULT_MAX_NODES);
+    }
+
+    #[test]
+    fn parse_bool_env_accepts_common_forms() {
+        for s in ["1", "true", "TRUE", "True", "yes", "on", "YeS", "On"] {
+            assert!(parse_bool_env(s), "expected true for {:?}", s);
+        }
+        for s in ["0", "false", "no", "off", "", "   ", "garbage"] {
+            assert!(!parse_bool_env(s), "expected false for {:?}", s);
+        }
+    }
+
+    #[test]
+    fn from_config_applies_byte_budget() {
+        let cfg = CacheConfig { enabled: true, max_bytes: 1024, max_nodes: 100 };
+        let t = PrefixTrie::from_config(&cfg);
+        assert_eq!(t.max_cached_bytes, 1024);
+        assert_eq!(t.max_nodes, 100);
+    }
+
+    #[test]
+    fn byte_budget_evicts_on_overflow() {
+        // max_bytes = 400 — room for exactly one 384-byte block (3 tokens
+        // * 128 B mk_block), second insert must evict the first.
+        let mut t = PrefixTrie::with_byte_budget(16, 400);
+        t.insert(&[1, 2, 3], mk_block_bytes(1, 384));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Inserting a second 384-byte block takes us to 768 > 400 → evict.
+        t.insert(&[4, 5, 6], mk_block_bytes(2, 384));
+        assert!(t.cached_bytes() <= 400, "byte budget must be honoured");
+        assert_eq!(t.len(), 1, "byte budget should keep one entry");
+        // The survivor is the newly-inserted (freshest) one.
+        assert!(t.longest_prefix(&[4, 5, 6]).is_some());
+        assert!(t.longest_prefix(&[1, 2, 3]).is_none());
+    }
+
+    #[test]
+    fn zero_byte_budget_means_unbounded_bytes() {
+        // with_byte_budget(..., 0) behaves like `new` — only node count matters.
+        let mut t = PrefixTrie::with_byte_budget(16, 0);
+        for i in 0..10u32 {
+            t.insert(&[i, i + 1, i + 2], mk_block_bytes(i, 10_000));
+        }
+        assert_eq!(t.len(), 10);
+        assert_eq!(t.cached_bytes(), 100_000);
     }
 }
