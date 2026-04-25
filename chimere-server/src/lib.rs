@@ -48,6 +48,7 @@ pub mod moe_router;
 pub mod metrics;
 pub mod mtp_scheduler;
 pub mod prefill;
+pub mod prefix_cache;
 pub mod profile;
 pub mod qwen35_model;
 pub mod raw_forward;
